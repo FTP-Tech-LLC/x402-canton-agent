@@ -1,0 +1,43 @@
+{
+  "name": "@ftptech/canton-agent-wallet",
+  "private": false,
+  "version": "0.6.1",
+  "description": "Self-custody Canton wallet + x402 autopay for AI agents. One CLI: create, pay, balance, withdraw, export, import. Backs the canton-x402-agent skill.",
+  "license": "Apache-2.0",
+  "author": "FTP team",
+  "type": "module",
+  "bin": {
+    "canton-agent-wallet": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "lint": "eslint src --max-warnings 0"
+  },
+  "dependencies": {
+    "@canton-network/core-tx-visualizer": "~1.4.0",
+    "@canton-network/core-ledger-proto": "~1.4.0",
+    "@ftptech/x402-canton-ledger": "^0.1.1",
+    "@ftptech/x402-canton-client": "workspace:^",
+    "undici": "^7.1.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "homepage": "https://github.com/sunstrike228/canton-x402-agent/tree/main/packages/agent-wallet#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sunstrike228/canton-x402-agent.git",
+    "directory": "packages/agent-wallet"
+  },
+  "bugs": {
+    "url": "https://github.com/sunstrike228/canton-x402-agent/issues"
+  }
+}
