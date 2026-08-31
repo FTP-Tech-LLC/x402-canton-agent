@@ -8,6 +8,8 @@ import {
   resolveRelayUrl,
   DEFAULT_NETWORK,
   MISSING_RELAY_HELP,
+  withdrawAmount,
+  preapprovalMode,
 } from "./cli-args.js";
 
 describe("cli-args.flag", () => {
@@ -79,6 +81,36 @@ describe("cli-args.boolFlag", () => {
     expect(boolFlag(["merge", "--yes"], "--yes")).toBe(true);
     expect(boolFlag(["merge"], "--yes")).toBe(false);
     expect(boolFlag(["merge", "--dry-run", "--yes"], "--yes")).toBe(true);
+  });
+
+  it("REFUSES the equals spelling instead of reading it as absent", () => {
+    // `flag()` and `flagPresent()` were both taught `--name=value` after the
+    // equals form on `withdraw --amount=5` meant "amount absent", i.e. sweep the
+    // whole wallet. boolFlag stayed on a bare `includes()`, so the same keystroke
+    // has the same shape of consequence here: `merge --dry-run=true` reads as
+    // dry-run ABSENT and submits real batch transfers instead of printing a plan.
+    // `preapproval --status=true` likewise runs the real preapproval.
+    //
+    // Refusing, rather than parsing "true"/"false", is the deliberate choice:
+    // reading presence would turn `--dry-run=false` into a dry run, and reading
+    // the value would turn a typo'd `--dry-run=yes` into real transfers. Both
+    // guesses pick an outcome the operator did not ask for. The bare spelling is
+    // the only unambiguous one, so say that.
+    for (const v of ["true", "false", "yes", "1", ""]) {
+      expect(() => boolFlag(["merge", `--dry-run=${v}`], "--dry-run")).toThrow(
+        /--dry-run/
+      );
+    }
+    expect(() => boolFlag(["preapproval", "--status=true"], "--status")).toThrow(
+      /--status/
+    );
+  });
+
+  it("does not confuse a different flag that shares a prefix", () => {
+    // `--dry-run-x=1` is not `--dry-run`. A startsWith check without the `=`
+    // would have thrown on it.
+    expect(boolFlag(["merge", "--dry-run-x=1"], "--dry-run")).toBe(false);
+    expect(boolFlag(["merge", "--dry-runner"], "--dry-run")).toBe(false);
   });
 });
 
@@ -177,5 +209,110 @@ describe("preapproval value flags", () => {
     expect(flag(args, "--expires-at")).toBe("2026-10-01T00:00:00Z");
     expect(flag(args, "--operator-token")).toBe("op-secret");
     expect(boolFlag(args, "--status")).toBe(true);
+  });
+});
+
+/**
+ * `withdraw` sends the FULL balance when --amount is omitted. The CLI used to
+ * funnel the flag through a truthiness filter, so a present-but-empty value read
+ * exactly like omission — and `--amount "$AMT"` with AMT unset swept the wallet.
+ */
+describe("withdrawAmount — present-but-empty is not absent", () => {
+  it("omitted means full balance", () => {
+    expect(withdrawAmount(["--to", "p"])).toEqual({ kind: "full" });
+  });
+
+  it("an explicit amount is used verbatim", () => {
+    expect(withdrawAmount(["--to", "p", "--amount", "0.25"])).toEqual({
+      kind: "amount",
+      amount: "0.25",
+    });
+  });
+
+  it("an EMPTY value is refused, never treated as a sweep", () => {
+    const r = withdrawAmount(["--to", "p", "--amount", ""]);
+    expect(r.kind).toBe("error");
+    if (r.kind === "error") expect(r.message).toMatch(/no value/i);
+  });
+
+  it("whitespace is refused too", () => {
+    expect(withdrawAmount(["--to", "p", "--amount", "   "]).kind).toBe("error");
+  });
+
+  it("a TRAILING --amount with nothing after it is refused", () => {
+    // The unquoted-unset-variable shape: argv ends with the flag itself.
+    expect(withdrawAmount(["--to", "p", "--amount"]).kind).toBe("error");
+  });
+});
+
+/**
+ * The documented default of `preapproval` is SELF-provision. The mode used to be
+ * switched by `CANTON_X402_OPERATOR_TOKEN` in the ambient environment — a name
+ * that everywhere else in this repo is the FACILITATOR SERVER's own secret. On
+ * the facilitator host, sourcing its .env silently changed which party becomes
+ * the provider and who prepays the holding fee.
+ */
+describe("preapprovalMode — only the flag picks the mode", () => {
+  it("no flag, clean env → self-provision", () => {
+    expect(preapprovalMode([], {})).toEqual({ mode: "self", ambientIgnored: false });
+  });
+
+  it("an ambient operator token does NOT switch the mode, and is reported", () => {
+    expect(
+      preapprovalMode([], { CANTON_X402_OPERATOR_TOKEN: "server-secret" })
+    ).toEqual({ mode: "self", ambientIgnored: true });
+  });
+
+  it("the flag DOES switch it — the legacy mode stays reachable on purpose", () => {
+    // DISCRIMINATOR: this is an opt-in mode, not a removed one.
+    expect(
+      preapprovalMode(["--operator-token", "t"], {})
+    ).toEqual({ mode: "legacy", operatorToken: "t" });
+  });
+
+  it("an empty --operator-token is not an opt-in", () => {
+    expect(
+      preapprovalMode(["--operator-token", ""], { CANTON_X402_OPERATOR_TOKEN: "s" })
+    ).toEqual({ mode: "self", ambientIgnored: true });
+  });
+});
+
+describe("--flag=value is the same instruction as --flag value", () => {
+  it("withdraw --amount=5 sends 5, not the whole wallet", () => {
+    // The presence check was an exact `includes("--amount")`, so the equals form
+    // read as "no --amount" — which on withdraw means FULL BALANCE. A user who
+    // typed an amount got their wallet swept. Published command, real money.
+    const r = withdrawAmount(["withdraw", "--amount=5", "--to", "x::1220a"]);
+    expect(r.kind).toBe("amount");
+    if (r.kind === "amount") expect(r.amount).toBe("5");
+  });
+
+  it("the spaced form still works", () => {
+    const r = withdrawAmount(["withdraw", "--amount", "5"]);
+    expect(r.kind).toBe("amount");
+    if (r.kind === "amount") expect(r.amount).toBe("5");
+  });
+
+  it("omitting --amount entirely still means the FULL balance", () => {
+    // The discriminator: the fix must not turn an intentional full sweep into
+    // an error, or every honest `withdraw --to x` breaks.
+    expect(withdrawAmount(["withdraw", "--to", "x::1220a"]).kind).toBe("full");
+  });
+
+  it("--amount= with nothing after it is still refused, not treated as absent", () => {
+    const r = withdrawAmount(["withdraw", "--amount="]);
+    expect(r.kind).toBe("error");
+  });
+
+  it("flag() reads a value flag in either spelling", () => {
+    expect(flag(["--relay-url=https://f.example"], "--relay-url")).toBe("https://f.example");
+    expect(flag(["--relay-url", "https://f.example"], "--relay-url")).toBe("https://f.example");
+  });
+
+  it("--asset takes a value, so the URL after it stays the first positional (the documented `pay --asset USDCx <url>` form)", () => {
+    expect(positionals(["--asset", "USDCx", "https://api.example.com/data"])).toEqual([
+      "https://api.example.com/data",
+    ]);
+    expect(flag(["--asset", "USDCx", "https://api.example.com/data"], "--asset")).toBe("USDCx");
   });
 });

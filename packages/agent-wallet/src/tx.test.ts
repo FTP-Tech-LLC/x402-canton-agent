@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { createHash } from "node:crypto";
-import { transfer, claimAll } from "./tx.js";
+import { transfer, claimAll, payViaTransferFactory } from "./tx.js";
 import { RelayClient } from "./relay-client.js";
 import { generateAgentKey, verifyHashB64 } from "./keys.js";
 import { PreparedTransferMismatchError, type HashBindingOptions } from "./verify-prepared.js";
@@ -119,7 +119,7 @@ function stubRelay(script: RelayScript = {}): { executed: () => boolean; seen: s
         script.onExecute?.(JSON.parse(init.body ?? "{}"));
         return new Response(JSON.stringify({ updateId: "u1" }), { status: 200 });
       }
-      if (url.endsWith("/pending")) {
+      if (/\/pending(\?.*)?$/.test(url)) {
         return new Response(
           JSON.stringify({ party: w.party, pending: [{ cid: "ti1", amount: "5.0" }] }),
           { status: 200 }
@@ -356,5 +356,156 @@ describe("claimAll", () => {
       claimAll(new RelayClient({ relayUrl: "http://relay" }), wallet())
     ).rejects.toBeInstanceOf(PreparedTransferMismatchError);
     expect(r.executed()).toBe(false);
+  });
+});
+
+describe("payViaTransferFactory — inline carriage", () => {
+  const key = generateAgentKey();
+  const PARTY = "agent::1220" + "aa".repeat(32);
+  const MERCHANT = "merch::1220" + "bb".repeat(32);
+  const DSO = "DSO::1220" + "ee".repeat(32);
+  const AMOUNT = "0.2500000000";
+
+  /** A prepared transfer this wallet genuinely intends — so verify-before-sign
+   *  runs for real. Mocking those legs out would make the test prove nothing
+   *  about the thing they exist to protect. */
+  const PREPARED = buildPrepared({
+    sender: PARTY,
+    receiver: MERCHANT,
+    amount: AMOUNT,
+    admin: DSO,
+    id: "Amulet",
+  });
+  const HASH = createHash("sha256").update(PREPARED).digest("base64");
+
+  function harness() {
+    const calls: { prepare: Record<string, unknown>[]; commit: unknown[] } = {
+      prepare: [],
+      commit: [],
+    };
+    const relay = {
+      payPrepare: async (b: Record<string, unknown>) => {
+        calls.prepare.push(b);
+        return {
+          submissionRef: "ref-1",
+          preparedTransaction: PREPARED,
+          txHash: HASH,
+          executeBefore: new Date(Date.now() + 60_000).toISOString(),
+          sender: PARTY,
+          receiver: MERCHANT,
+          amount: AMOUNT,
+          instrumentId: { admin: DSO, id: "Amulet" },
+        };
+      },
+      payCommit: async (b: unknown) => {
+        calls.commit.push(b);
+      },
+    } as never;
+    return { relay, calls };
+  }
+
+  const wallet = {
+    party: PARTY,
+    privateKeyPkcs8Pem: key.privateKeyPkcs8Pem,
+    publicKeyFingerprint: "1220" + "aa".repeat(32),
+  } as never;
+  // The relay hash is trusted only because this test is not exercising the
+  // hash-binding leg; every other test in this file covers that.
+  const hashBinding: HashBindingOptions = { trustRelayHash: true };
+
+  it("returns the signed bytes inline and never commits to a stash", async () => {
+    const { relay, calls } = harness();
+    const r = await payViaTransferFactory(relay, wallet, {
+      receiver: MERCHANT,
+      amount: AMOUNT,
+      expectInstrumentAdmin: DSO,
+      hashBinding,
+    });
+
+    // Nothing is committed back — the payload carries the transaction itself.
+    expect(calls.commit).toHaveLength(0);
+    expect(r.preparedTransactionBytes).toEqual(Buffer.from(PREPARED, "base64"));
+    expect(typeof r.signatureB64).toBe("string");
+    expect(typeof r.preparedTxHashHex).toBe("string");
+  });
+
+  // REGRESSION: for Amulet the instrument admin (the DSO) is pinned in verify-
+  // before-sign but must NOT be sent to pay/prepare — the relay rejects a supplied
+  // admin that is not a configured registry (the DSO is not one), which broke CC
+  // pay/prepare with a 400. The two uses of expectInstrumentAdmin are decoupled by
+  // `registryInstrument`: only a registry token names the instrument to the relay.
+  it("Amulet: pins the DSO in verify but does NOT send instrumentId to the relay", async () => {
+    const { relay, calls } = harness();
+    await payViaTransferFactory(relay, wallet, {
+      receiver: MERCHANT,
+      amount: AMOUNT,
+      expectInstrumentId: "Amulet",
+      expectInstrumentAdmin: DSO,
+      // registryInstrument omitted (Amulet)
+      hashBinding,
+    });
+    expect(calls.prepare[0]?.["instrumentId"]).toBeUndefined();
+  });
+
+  it("registry token: DOES send instrumentId {admin,id} to the relay", async () => {
+    const { relay, calls } = harness();
+    await payViaTransferFactory(relay, wallet, {
+      receiver: MERCHANT,
+      amount: AMOUNT,
+      expectInstrumentId: "Amulet",
+      expectInstrumentAdmin: DSO,
+      registryInstrument: true,
+      hashBinding,
+    });
+    expect(calls.prepare[0]?.["instrumentId"]).toEqual({ admin: DSO, id: "Amulet" });
+  });
+});
+
+describe("transfer() must not hand a registry factory Canton Coin holdings", () => {
+  // /balance enumerates Amulet only, so the default input selection can only
+  // produce CC contract ids. Passing those to a registry token's factory is the
+  // same class as the empty-list bug that broke live once: the registry is
+  // asked to spend inputs that are not its instrument. This entry point ships
+  // in the published package, so it fails closed instead of guessing.
+  it("refuses registryInstrument without explicit inputHoldingCids", async () => {
+    const relay = {
+      balance: async () => {
+        throw new Error("balance must NOT be consulted for a registry transfer");
+      },
+      resolveTransferFactory: async () => {
+        throw new Error("the relay must NOT be reached");
+      },
+    };
+    await expect(
+      transfer(relay as never, { party: "agent::1220a" } as never, {
+        receiver: "merchant::1220m",
+        amount: "0.1000000000",
+        registryInstrument: true,
+        expectInstrumentAdmin: "usdcx-admin::1220",
+        expectInstrumentId: "USDCx",
+      } as never)
+    ).rejects.toThrow(/explicit inputHoldingCids/i);
+  });
+
+  it("but Amulet still defaults from /balance, exactly as before", async () => {
+    // The discriminator against over-correcting into "transfer always needs
+    // explicit inputs": the CC path is untouched.
+    let asked = false;
+    const relay = {
+      balance: async () => {
+        asked = true;
+        return { holdings: [{ cid: "cc-1" }] };
+      },
+      resolveTransferFactory: async () => {
+        throw new Error("STOP-AFTER-BALANCE");
+      },
+    };
+    await expect(
+      transfer(relay as never, { party: "agent::1220a" } as never, {
+        receiver: "merchant::1220m",
+        amount: "0.1000000000",
+      } as never)
+    ).rejects.toThrow(/STOP-AFTER-BALANCE/);
+    expect(asked).toBe(true);
   });
 });

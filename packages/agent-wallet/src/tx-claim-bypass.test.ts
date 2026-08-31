@@ -75,7 +75,7 @@ function stubMaliciousClaimRelay(prepared: string): {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init: { body?: string } = {}) => {
-      if (url.endsWith("/pending")) {
+      if (/\/pending(\?.*)?$/.test(url)) {
         return new Response(
           JSON.stringify({ party: w.party, pending: [{ cid: "ti1", amount: "5.0" }] }),
           { status: 200 }

@@ -23,13 +23,15 @@ Bin: `canton-agent-wallet`.
 
 ```
 canton-agent-wallet create --relay-url <url>        # generate + onboard a self-custody wallet (idempotent)
+canton-agent-wallet fund --relay-url <url> --pay-proxy-url <url>   # bootstrap a FUNDED wallet via the pay-proxy quest (see below)
 canton-agent-wallet address                         # print the party id (fund this)
-canton-agent-wallet balance                         # print CC balance
-canton-agent-wallet claim                           # accept incoming transfers (e.g. the initial funding)
-canton-agent-wallet merge [--target <n>] [--batch <n>] [--max-rounds <n>] [--dry-run]   # consolidate dust amulets so a busy wallet can be enumerated + spent again
+canton-agent-wallet balance                         # print the balance of every instrument the wallet holds (CC + any CIP-56 registry token, e.g. USDCx)
+canton-agent-wallet claim                           # accept incoming transfers — CC and registry tokens (expired offers are skipped; one bad offer never blocks the rest)
+canton-agent-wallet merge [--target <n>] [--batch <n>] [--max-rounds <n>] [--dry-run] [--admin <registrar> --id <instrument>]   # consolidate dust (CC, or a registry token) so a busy wallet can be enumerated + spent again
 canton-agent-wallet preapproval [--status] [--admin <DSO>] [--days <n>]   # MERCHANT: self-provision this wallet's own TransferPreapproval so transfer-factory payments settle in one round-trip (--status just checks)
 canton-agent-wallet pay --relay-url <url> <url>      # fetch a URL, auto-paying any x402 402 challenge
-canton-agent-wallet withdraw --to <party> [--amount <cc>]   # send CC back out (default: full balance)
+canton-agent-wallet swap --in <SYM> --out <SYM> --amount <n> [--slippage <pct>] [--direct] [--no-wait] [--max-fee <cc>] [--swap-merchant <party>] [--no-preapprove]   # swap CC <-> a CIP-56 registry token via Tradecraft; waits for the output to land (see below)
+canton-agent-wallet withdraw --to <party> [--amount <n>] [--admin <registrar> --id <instrument>]   # send CC (default: full balance) or a registry token back out
 canton-agent-wallet export                           # print the private key (backup; guard it)
 ```
 
@@ -39,6 +41,26 @@ default would silently send payments to a dead host, so the CLI fails fast when
 none is given. `address`, `balance`, `claim`, `withdraw` and `export` reuse the
 relay stored in the wallet at `create` time. The current FTP facilitator is
 `https://facilitator.ftptech.xyz`.
+
+### `fund`: bootstrap a funded wallet through the quest
+
+The facilitator's raw faucet is locked (internal callers only), so out-of-box
+funding goes through the pay-proxy QUEST, which binds the grant to a real x402
+payment: the pay-proxy mints a wallet, grants it CC, immediately spends the bulk
+on a CanTrust image call, and returns the wallet KEY plus the small change (and
+the image URL). `fund` runs that flow and IMPORTS the returned key, so the agent
+self-custodies the funded wallet afterwards (the pay-proxy keeps nothing).
+
+```
+canton-agent-wallet fund --relay-url https://facilitator.ftptech.xyz \
+  --pay-proxy-url https://pay.ftptech.xyz [--prompt "an image prompt"]
+```
+
+`--pay-proxy-url` (or `CANTON_AGENT_PAY_PROXY_URL`) is required. NO-CLOBBER: if a
+wallet already exists AND holds a balance, it is never replaced — `fund` reports
+it and exits. Only an absent or empty wallet home is bootstrapped. NOTE the
+imported wallet is a fresh server-minted party (bootstrapping replaces an empty
+wallet's party); back up any key you care about with `export` first.
 
 ### Merchant onboarding: self-provision a `TransferPreapproval`
 
@@ -80,6 +102,21 @@ canton-agent-wallet merge             # consolidate (defaults: --batch 90, --tar
 canton-agent-wallet merge --yes       # required for a LARGE whale pass (>20 batches; see cost note)
 ```
 
+A CIP-56 registry token (USDCx and the rest of the DA Registry family) merges the
+same way, with the instrument named explicitly:
+
+```bash
+canton-agent-wallet merge --admin <registrar party> --id USDCx [--dry-run]
+```
+
+The mechanics differ underneath: a registry self-transfer only collapses its
+inputs when it moves their **full** sum (a 1-atomic self-transfer leaves two
+holdings), so each batch is self-transferred for its exact total, holdings are
+read through the token-standard `HoldingV1` view, locked holdings are never used
+as inputs, and the default target is 1 holding. The registrar must be a known or
+trusted registry admin (`CANTON_AGENT_REGISTRY_TRUSTED_PARTIES` for one the
+wallet does not ship with).
+
 For a wallet already too large to enumerate on-ledger, `merge` reads the holdings
 from the public SV Scan ACS snapshot (paginated, no node cap), sweeps over them
 once, and then **chains on each batch's own output amulets** — after every batch it
@@ -108,6 +145,68 @@ so the first-run flow is:
 `create --relay-url https://facilitator.ftptech.xyz` → tell your human to send CC to
 the printed party id → `claim` → `balance`. Funding once is the only human step,
 exactly like funding an EVM agent.
+
+### Swap: CC ↔ CIP-56 registry tokens
+
+`swap` exchanges CC for a DA Registry token (USDCx, CBTC, USDXLR, cETH, eXAG,
+eXAU) or back, on the Tradecraft AMM (`api.tradecraft.fi`). It sends the
+input to the pair's pool party and receives the counter-asset; the output
+preapproval is auto-provisioned so the pool can deliver directly.
+
+```bash
+canton-agent-wallet swap --in CC --out USDCx --amount 7           # buy: 7 CC -> USDCx
+canton-agent-wallet swap --in USDCx --out CC --amount 0.78        # sell: 0.78 USDCx -> CC
+```
+
+**Default path — our x402 swap endpoint.** The ticket (pool party, `amm_cid`,
+slippage minimum) is fetched from a hosted endpoint for a small CC fee, so it
+stays correct when Tradecraft rotates a pool address, the `amm_cid`, or a
+minimum. Override the endpoint with `CANTON_AGENT_SWAP_URL`.
+
+**`--direct` — free, straight from Tradecraft.** Bypasses the endpoint (and its
+fee) and builds the ticket by querying `api.tradecraft.fi` itself, deriving the
+pool party from the `amm_cid` baked into this release. Two things are then on
+you: that pinned `amm_cid` is only as current as the release (Tradecraft can
+rotate it), and the reply is trusted as it comes — the endpoint path re-checks
+the ticket against your own trusted `amm_cid` and instruments before signing.
+It is the power-user escape hatch, not the preferred path.
+
+**Waits for the output (default).** `swap` returns only once the counter-asset is
+actually in the wallet — it polls your output balance (claiming any returning offer
+each tick, which also recovers a below-minimum trade's returned input) until the
+rise reaches the ticket's minimum output, so there is no separate `claim` step
+afterwards. This covers both a registry output the pool delivers directly to your
+preapproval and a CC output that arrives as an offer. Anything already pending
+before the swap is claimed into the baseline first, and a rise below the minimum is
+reported as such — an unrelated inbound landing mid-wait is never presented as the
+fill. It prints `received <amount> <SYM>` on arrival, or, if the wait window
+(~2 min) elapses, a note that it may still be settling or the trade was below the
+pool minimum (input returned). A relay error during the wait never fails the
+command — the input was already sent, so it degrades to a missed poll and the
+`updateId` is always printed. Pass **`--no-wait`** to return as soon as the input is
+sent (fire-and-forget) and pick up the output yourself with `claim` — for
+automation that must not block.
+
+**Slippage.** `--slippage <pct>` is enforced **on-ledger only when the ticket
+carries a memo key** — the floor rides in the transfer memo the pool reads.
+Without a memo key the trade fills at **market price** and the CLI prints
+`! no slippage protection on this ticket …` so the absence is never silent. An
+input below the pool's minimum is safely returned by the pool (no loss).
+
+**The endpoint fee is bounded.** The endpoint is untrusted for money safety, so
+the 402 it answers with is capped at 0.5 CC (`--max-fee <cc>` to change) and, when
+you name the merchant (`--swap-merchant <party>` or `CANTON_AGENT_SWAP_MERCHANT`),
+the payment is pinned to that payee — a hijacked endpoint then cannot be paid at
+all.
+
+The output preapproval is provisioned automatically so the pool can deliver the
+counter-asset directly; `--no-preapprove` skips it (e.g. it already exists).
+
+Env: `CANTON_AGENT_SWAP_URL` (endpoint override), `CANTON_AGENT_TRADECRAFT_AMM_CID`
+(the trusted `amm_cid` every ticket's pool party must derive from — a compromised
+endpoint cannot redirect funds to another party), `CANTON_AGENT_SWAP_MERCHANT`
+(pin the expected fee payee), `CANTON_AGENT_TRADECRAFT_API` and
+`CANTON_AGENT_TRADECRAFT_MEMO_KEY` (used by `--direct`).
 
 ## Programmatic API
 
@@ -147,6 +246,17 @@ then retries the request with the on-ledger proof.
   (`http://user:pass@host:port`) and never logged.
 - `CANTON_AGENT_HOME`: override the wallet directory (default `~/.canton-agent`;
   used by tests and power users).
+- `CANTON_AGENT_VENUE_KEY` + `CANTON_AGENT_VENUE_TAG`: venue attribution, **off by
+  default** (both must be set). When set — e.g. `CANTON_AGENT_VENUE_KEY=ftp/venue`
+  and `CANTON_AGENT_VENUE_TAG=ftp/agentic-wallet` — the wallet stamps that key/value
+  into the metadata of every outbound **CIP-56 registry token** transfer it authors
+  (swap-sell, withdraw, and x402 pay), so a token issuer's incentive program can
+  attribute that activity to this venue. Generic across tokens (CBTC, USDXLR, …);
+  set your own key/value, but the key **must end in `/venue`** and fit 64 chars, and
+  the tag 128 chars — the facilitator's pay/prepare enforces exactly these bounds,
+  so a non-conforming config stamps nothing (one stderr warning) instead of breaking
+  payments. Advisory metadata only (rides in `transfer.meta.values`, not
+  money-critical); Canton Coin is never stamped.
 
 ## Your wallet is YOURS (self-custody)
 

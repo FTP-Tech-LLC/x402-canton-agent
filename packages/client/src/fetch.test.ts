@@ -25,8 +25,9 @@ function fakeSigner(): CantonSigner {
     party: PAYER,
     signTransferFactory: vi.fn().mockResolvedValue({
       payerParty: PAYER,
-      submissionRef: "1220submission-ref",
-      preparedTxHash: "1220prepared-tx-hash",
+      preparedTxHash: "ab".repeat(32),
+      preparedTransactionBytes: new Uint8Array([1, 2, 3, 4]),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
     }),
   };
 }
@@ -54,6 +55,66 @@ function paymentRequiredHeader(req: X402PaymentRequired): string {
 }
 
 describe("wrapFetchWithCantonPayment", () => {
+  it("a 400 error page from the merchant's EDGE (header too large) becomes MERCHANT_HEADER_LIMIT with the fix in the message", async () => {
+    const signer = fakeSigner();
+    let n = 0;
+    const fetch = vi.fn(async () => {
+      n++;
+      if (n === 1) {
+        const required: X402PaymentRequired = {
+          x402Version: 2,
+          resource: { url: "https://api.example.com/data" },
+          accepts: [requirements()],
+        };
+        return new Response("{}", {
+          status: 402,
+          headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+        });
+      }
+      // nginx's stock page, verbatim — what a default 8k buffer answers.
+      return new Response(
+        "<html><head><title>400 Request Header Or Cookie Too Large</title></head></html>",
+        { status: 400 }
+      );
+    }) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, signer);
+    let err: unknown;
+    try {
+      await wrapped("https://api.example.com/data");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(X402PaymentError);
+    expect((err as X402PaymentError).code).toBe("MERCHANT_HEADER_LIMIT");
+    expect((err as Error).message).toMatch(/16 KiB/);
+    expect((err as Error).message).toMatch(/large_client_header_buffers/);
+    expect((err as Error).message).toMatch(/nothing settled/);
+  });
+
+  it("the merchant's OWN 400 (no edge fingerprint) still passes through untouched, body readable", async () => {
+    const signer = fakeSigner();
+    let n = 0;
+    const fetch = vi.fn(async () => {
+      n++;
+      if (n === 1) {
+        const required: X402PaymentRequired = {
+          x402Version: 2,
+          resource: { url: "https://api.example.com/data" },
+          accepts: [requirements()],
+        };
+        return new Response("{}", {
+          status: 402,
+          headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+        });
+      }
+      return new Response(JSON.stringify({ error: "amountIn must be positive" }), { status: 400 });
+    }) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, signer);
+    const res = await wrapped("https://api.example.com/data");
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: "amountIn must be positive" });
+  });
+
   it("passes through non-402 responses unchanged", async () => {
     const fetch = vi.fn(
       async () => new Response("hello", { status: 200 })
@@ -136,8 +197,9 @@ describe("wrapFetchWithCantonPayment", () => {
       party: PAYER,
       signTransferFactory: vi.fn().mockResolvedValue({
         payerParty: PAYER,
-        submissionRef: "00submission-ref",
-        preparedTxHash: "00prepared-tx-hash",
+        preparedTxHash: "cd".repeat(32),
+        preparedTransactionBytes: new Uint8Array([5, 6, 7, 8]),
+        signatureB64: Buffer.alloc(64, 9).toString("base64"),
       }),
     };
     const tfReqs: PaymentRequirements = {
@@ -331,6 +393,48 @@ describe("wrapFetchWithCantonPayment", () => {
     expect(fetch).toHaveBeenCalledTimes(3);
   });
 
+  it("NEVER re-pays after an ambiguous execute outcome — one 402 is enough to stop", async () => {
+    // `invalid_exact_canton_execute_failed` is the facilitator's catch-all
+    // around the submit. Some of what lands there is a clean rejection with
+    // nothing spent; some is a network failure mid-submit where the participant
+    // may well have accepted the transaction. From here the two look identical,
+    // and a re-pay re-prepares over the payer's REMAINING holdings — so if the
+    // first one committed, the payer pays twice for one purchase.
+    //
+    // STOP_IF_REPEATED is the wrong tool for that: it permits exactly one
+    // re-pay before bailing, and that one re-pay IS the double payment.
+    const required: X402PaymentRequired = {
+      x402Version: 2,
+      resource: { url: "https://example.com" },
+      accepts: [requirements()],
+    };
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ error: "invalid_exact_canton_execute_failed" }),
+          {
+            status: 402,
+            headers: {
+              [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required),
+            },
+          }
+        )
+    ) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
+      maxPaymentRetries: 4,
+      sleep: async () => {},
+    });
+
+    // PAYMENT_UNCONFIRMED, not PAYMENT_REJECTED: `code` is the only field a
+    // program can branch on, and an integrator whose "rejected -> mint a fresh
+    // payment" path fires on it would pay twice for one purchase.
+    await expect(wrapped("https://example.com")).rejects.toMatchObject({
+      code: "PAYMENT_UNCONFIRMED",
+    });
+    // 1 probe + exactly 1 pay. Never a second payment.
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it("retries a TRANSIENT network failure from createPaymentPayload (ETIMEDOUT) instead of killing the pay", async () => {
     // A dropped TLS read while talking to the relay surfaces as
     // `TypeError: fetch failed` with cause.code ETIMEDOUT — a network blip,
@@ -359,8 +463,9 @@ describe("wrapFetchWithCantonPayment", () => {
       .mockRejectedValueOnce(netErr)
       .mockResolvedValueOnce({
         payerParty: PAYER,
-        submissionRef: "1220submission-after-blip",
-        preparedTxHash: "1220prepared-after-blip",
+        preparedTxHash: "ef".repeat(32),
+        preparedTransactionBytes: new Uint8Array([2, 4, 6, 8]),
+        signatureB64: Buffer.alloc(64, 3).toString("base64"),
       });
     const wrapped = wrapFetchWithCantonPayment(fetch, signer, {
       maxPaymentRetries: 2,
@@ -1603,5 +1708,130 @@ describe("wrapFetchWithCantonPayment — capability-aware method selection", () 
     expect(await res.text()).toBe("paid");
     // it paid via the transfer-factory signer, not the unsupported entry
     expect(signer.signTransferFactory as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * The ambiguity guard and the retry budget both stop the loop; they differ in
+ * what they TELL the caller, and on an ambiguous reason that difference is the
+ * whole point. The budget check used to run first, so an ambiguous reason
+ * arriving on the FINAL attempt was reported as a definite "facilitator
+ * rejected the payment" — and a caller acting on "rejected" pays again for a
+ * purchase that may already have settled.
+ */
+describe("ambiguity outranks the retry budget", () => {
+  const AMBIGUOUS = "invalid_exact_canton_execute_failed";
+  const required: X402PaymentRequired = {
+    x402Version: 2,
+    resource: { url: "https://example.com" },
+    accepts: [requirements()],
+  };
+  const reply = (reason: string) =>
+    new Response(JSON.stringify({ error: reason }), {
+      status: 402,
+      headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+    });
+
+  it("stays reachable with maxPaymentRetries 0", async () => {
+    // The documented "restores the old at-most-twice behavior" setting made
+    // `attempt(0) >= maxRetries(0)` true on the very first 402, so the guard
+    // never ran at all on this configuration.
+    const fetch = vi.fn(async () => reply(AMBIGUOUS)) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
+      maxPaymentRetries: 0,
+      sleep: async () => {},
+    });
+    await expect(wrapped("https://example.com")).rejects.toThrow(
+      /could not confirm the payment/i
+    );
+  });
+
+  it("an ambiguous reason on the LAST attempt is not called a rejection", async () => {
+    // Retryable reasons first, then the ambiguous one exactly as the budget
+    // runs out — the interleaving the old ordering got wrong.
+    // Indexed by CALL: [0] is the unpaid probe, then one entry per paid
+    // attempt. maxPaymentRetries 2 means attempts 0,1,2 — so the ambiguous
+    // reason must land on call 3, the attempt where the budget runs out. Put
+    // it any earlier and BOTH orderings answer correctly, which is how this
+    // test first passed against the bug.
+    const byCall = [
+      "invalid_exact_canton_input_contention", // probe
+      "invalid_exact_canton_input_contention", // attempt 0
+      "invalid_exact_canton_input_contention", // attempt 1
+      AMBIGUOUS, // attempt 2 === maxRetries -> the exhausting one
+    ];
+    let i = 0;
+    const fetch = vi.fn(async () =>
+      reply(byCall[Math.min(i++, byCall.length - 1)]!)
+    ) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
+      maxPaymentRetries: 2,
+      sleep: async () => {},
+    });
+    await expect(wrapped("https://example.com")).rejects.toThrow(
+      /could not confirm the payment[\s\S]*NOT pay again/i
+    );
+  });
+
+  it("a NON-ambiguous reason still exhausts into the rejection message", async () => {
+    // DISCRIMINATOR: the budget branch must keep its wording for reasons that
+    // really are definite, or every failure would read as unresolved.
+    const fetch = vi.fn(async () =>
+      reply("invalid_exact_canton_amount")
+    ) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
+      maxPaymentRetries: 1,
+      sleep: async () => {},
+    });
+    await expect(wrapped("https://example.com")).rejects.toThrow(
+      /facilitator rejected the payment/i
+    );
+  });
+});
+
+/**
+ * `code` is the only machine-readable field on X402PaymentError, so it is the
+ * one an integrator branches on. Both stopping branches used to throw
+ * PAYMENT_REJECTED, which made an unproven outcome indistinguishable from a
+ * definite refusal in the one place a program can see.
+ */
+describe("the ambiguous outcome has its own machine-readable code", () => {
+  const required: X402PaymentRequired = {
+    x402Version: 2,
+    resource: { url: "https://example.com" },
+    accepts: [requirements()],
+  };
+  const reply = (reason: string) =>
+    new Response(JSON.stringify({ error: reason }), {
+      status: 402,
+      headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+    });
+
+  it("an unproven settle is PAYMENT_UNCONFIRMED, not PAYMENT_REJECTED", async () => {
+    const fetch = vi.fn(async () =>
+      reply("invalid_exact_canton_execute_failed")
+    ) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
+      maxPaymentRetries: 2,
+      sleep: async () => {},
+    });
+    await expect(wrapped("https://example.com")).rejects.toMatchObject({
+      code: "PAYMENT_UNCONFIRMED",
+    });
+  });
+
+  it("a genuine refusal keeps PAYMENT_REJECTED", async () => {
+    // DISCRIMINATOR: the existing code must not be repurposed, or every
+    // integrator's rejection handling would silently stop firing.
+    const fetch = vi.fn(async () =>
+      reply("invalid_exact_canton_amount")
+    ) as typeof globalThis.fetch;
+    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
+      maxPaymentRetries: 1,
+      sleep: async () => {},
+    });
+    await expect(wrapped("https://example.com")).rejects.toMatchObject({
+      code: "PAYMENT_REJECTED",
+    });
   });
 });

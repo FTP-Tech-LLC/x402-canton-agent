@@ -38,18 +38,66 @@ export interface McpConfig {
    *  overrides this at create time. */
   network: string;
   apiKey?: string | undefined;
+  /** pay-proxy base URL used by `auto_fund` to bootstrap a funded wallet through
+   *  the quest (mint → grant → CanTrust payment → change). Optional: when unset,
+   *  `auto_fund` falls back to the manual-funding ask. Passed via --pay-proxy-url
+   *  or CANTON_AGENT_PAY_PROXY_URL. */
+  payProxyUrl?: string | undefined;
   policy: SpendPolicy;
 }
 
+/**
+ * Read `--name value` AND `--name=value`.
+ *
+ * This used to be `indexOf("--name")` only, so `--max-per-tx=1` did not match
+ * and read as "flag absent". In this package absent means UNCAPPED — every
+ * enforcement site is gated on `!== undefined` — so the equals spelling quietly
+ * removed the per-tx cap, both daily-cap branches, the `maxPaymentValue` that
+ * arms the relay-signer's over-quote breaker, and the refusal to sweep a full
+ * balance on an amount-less `withdraw`. `--home=/path` was dropped the same way,
+ * pointing the agent at the DEFAULT wallet, which is the very wallet the
+ * `canton-agent-wallet` CLI uses.
+ *
+ * agent-wallet's `cli-args.ts` was taught both spellings after the identical
+ * defect made `withdraw --amount=5` send the entire balance. This package
+ * carries its own private copy and did not get that fix; now it has it. Only
+ * the FIRST `=` splits, so a value may contain its own.
+ */
 function flag(argv: readonly string[], name: string): string | undefined {
+  const prefix = `--${name}=`;
+  const eq = argv.find((a) => a.startsWith(prefix));
+  if (eq !== undefined) return eq.slice(prefix.length);
   const i = argv.indexOf(`--${name}`);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : undefined;
 }
 
-function nonNegNum(v: string | undefined): number | undefined {
-  if (v === undefined) return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) && n >= 0 ? n : undefined;
+/**
+ * A spend cap that cannot be read is a REFUSAL TO START, not "no cap".
+ *
+ * The old version returned `undefined` for anything `Number()` could not parse
+ * — `"5 CC"`, `"1,5"`, an un-substituted `${MAX_PER_TX}` — and `undefined` is
+ * how this package spells uncapped. So "I could not read your limit" and "you
+ * asked for no limit" produced the same money policy, on a server whose only
+ * report of the resolved policy is a stderr line that MCP clients hide.
+ *
+ * Empty/whitespace reads as UNSET rather than as an error: a bare `KEY=` line in
+ * a .env is how operators comment a knob out, and `Number("")` is 0 — which
+ * would otherwise have made it a cap of ZERO that refuses every payment. An
+ * explicit `0` still means 0, because "allow nothing" is a real policy.
+ */
+function nonNegNum(raw: string | undefined, where: string): number | undefined {
+  if (raw === undefined) return undefined;
+  const t = raw.trim();
+  if (t === "") return undefined;
+  const n = Number(t);
+  if (!Number.isFinite(n) || n < 0) {
+    throw new Error(
+      `${where} must be a non-negative number, got ${JSON.stringify(raw)}. ` +
+        `Refusing to start: an unreadable spend cap used to be treated as NO ` +
+        `cap, which silently removed every limit on this wallet.`
+    );
+  }
+  return n;
 }
 
 export function resolveConfig(
@@ -75,6 +123,9 @@ export function resolveConfig(
 
   const apiKey = flag(argv, "api-key") ?? env.CANTON_AGENT_API_KEY;
 
+  const payProxyUrl =
+    flag(argv, "pay-proxy-url") ?? env.CANTON_AGENT_PAY_PROXY_URL;
+
   const allowRaw = flag(argv, "allow-domains") ?? env.CANTON_MCP_ALLOW_DOMAINS ?? "";
   const allowDomains: string[] | "*" =
     allowRaw.trim() === "*"
@@ -86,9 +137,24 @@ export function resolveConfig(
 
   // funded-ceiling defaults ON; disable with --no-funded-ceiling or
   // CANTON_MCP_FUNDED_CEILING=false.
+  //
+  // A bare switch, and `--no-funded-ceiling=false` is REFUSED rather than
+  // guessed at. Reading it as "present, so disable" turns off the ceiling for
+  // someone who wrote `=false` meaning to keep it; reading it as "false, so
+  // keep" ignores an operator who wrote `=true` meaning to remove it. Both
+  // guesses silently pick a spend policy the operator did not ask for, so say
+  // which spelling to use instead.
+  const NO_CEIL = "--no-funded-ceiling";
+  const ceilEquals = argv.find((a) => a.startsWith(`${NO_CEIL}=`));
+  if (ceilEquals !== undefined) {
+    throw new Error(
+      `${NO_CEIL} is a bare switch: pass ${NO_CEIL} to disable the funded ` +
+        `ceiling, or omit it to keep the ceiling on. Got ` +
+        `${JSON.stringify(ceilEquals)} — refusing to guess which was meant.`
+    );
+  }
   const fundedCeiling = !(
-    argv.includes("--no-funded-ceiling") ||
-    env.CANTON_MCP_FUNDED_CEILING === "false"
+    argv.includes(NO_CEIL) || env.CANTON_MCP_FUNDED_CEILING === "false"
   );
 
   return {
@@ -96,9 +162,16 @@ export function resolveConfig(
     home,
     network,
     apiKey,
+    payProxyUrl,
     policy: {
-      maxPerTx: nonNegNum(flag(argv, "max-per-tx") ?? env.CANTON_MCP_MAX_PER_TX),
-      dailyCap: nonNegNum(flag(argv, "daily-cap") ?? env.CANTON_MCP_DAILY_CAP),
+      maxPerTx: nonNegNum(
+        flag(argv, "max-per-tx") ?? env.CANTON_MCP_MAX_PER_TX,
+        "--max-per-tx / CANTON_MCP_MAX_PER_TX"
+      ),
+      dailyCap: nonNegNum(
+        flag(argv, "daily-cap") ?? env.CANTON_MCP_DAILY_CAP,
+        "--daily-cap / CANTON_MCP_DAILY_CAP"
+      ),
       allowDomains,
       fundedCeiling,
     },

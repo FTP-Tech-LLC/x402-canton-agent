@@ -1,17 +1,17 @@
 {
   "name": "@ftptech/x402-canton-client",
-  "version": "0.6.0",
+  "version": "1.1.0",
   "description": "Canton x402 client SDK — payer side. ExactCantonScheme + signer abstractions for autonomous agents.",
   "license": "Apache-2.0",
   "author": "FTP team",
-  "homepage": "https://github.com/sunstrike228/canton-x402-agent/tree/main/packages/client#readme",
+  "homepage": "https://github.com/sunstrike228/canton-x402/tree/main/packages/client#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sunstrike228/canton-x402-agent.git",
+    "url": "git+https://github.com/sunstrike228/canton-x402.git",
     "directory": "packages/client"
   },
   "bugs": {
-    "url": "https://github.com/sunstrike228/canton-x402-agent/issues"
+    "url": "https://github.com/sunstrike228/canton-x402/issues"
   },
   "keywords": [
     "x402",
@@ -43,8 +43,8 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
-    "@ftptech/x402-canton-core": "^0.6.0",
-    "@ftptech/x402-canton-ledger": "^0.1.1"
+    "@ftptech/x402-canton-core": "^1.2.0",
+    "@ftptech/x402-canton-ledger": "^0.4.0"
   },
   "publishConfig": {
     "access": "public"

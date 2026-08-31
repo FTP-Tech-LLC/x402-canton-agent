@@ -81,7 +81,29 @@ export type X402PaymentErrorCode =
   | "MISSING_PAYMENT_REQUIRED_HEADER"
   | "MALFORMED_PAYMENT_REQUIRED"
   | "NO_ACCEPTABLE_SCHEME"
-  | "PAYMENT_REJECTED";
+  | "PAYMENT_REJECTED"
+  /**
+   * The facilitator could not confirm the payment. It MAY have settled
+   * on-ledger. Do not pay again from this outcome — read the payer's balance or
+   * the merchant's receipt first.
+   *
+   * Distinct from PAYMENT_REJECTED because `code` is the only machine-readable
+   * field on this error, and an integrator branches on it. The ambiguity guard
+   * and the retry-budget branch already carry different English, but both threw
+   * PAYMENT_REJECTED, so a caller whose "rejected → mint a fresh payment" path
+   * fires on that code paid twice for one purchase over an outcome nobody had
+   * proven. The sentence is not an API; this is.
+   */
+  | "PAYMENT_UNCONFIRMED"
+  /**
+   * The merchant's EDGE (a reverse proxy in front of them) refused the paid
+   * retry because the payment header exceeded its buffer — the merchant never
+   * saw the request and nothing settled; the signed transaction expires on its
+   * own. A real inline payment header is ~8–10 KiB and the scheme's transport
+   * guidance requires servers to accept at least 16 KiB end to end, so the fix
+   * is the merchant's proxy configuration, not the payer's code.
+   */
+  | "MERCHANT_HEADER_LIMIT";
 
 export function wrapFetchWithCantonPayment(
   fetch: typeof globalThis.fetch,
@@ -197,6 +219,25 @@ export function wrapFetchWithCantonPayment(
     //     resolve, and raw-Scan readers clear within a backoff or two). Bailing
     //     early here turned recoverable rapid-fire into hard payment failures.
     const STOP_IF_REPEATED = new Set(["unexpected_canton_ledger_error"]);
+
+    /**
+     * Reasons where the outcome is AMBIGUOUS about whether money moved, so a
+     * re-pay is not a retry — it is a second payment.
+     *
+     * `invalid_exact_canton_execute_failed` is the facilitator's catch-all
+     * around the submit itself. Some of what lands there is a clean rejection
+     * with nothing spent; some of it is a network failure mid-submit, where the
+     * participant may well have accepted the transaction. From here the two are
+     * indistinguishable, and re-paying re-prepares over the payer's REMAINING
+     * holdings — so if the first one did commit, the payer pays twice for one
+     * purchase and the second payment exists in no record.
+     *
+     * STOP_IF_REPEATED is the wrong tool: it allows exactly one re-pay before
+     * bailing, and one re-pay is already the double payment. Ambiguity has to
+     * stop on the FIRST occurrence and hand the decision to whoever can check
+     * the ledger.
+     */
+    const STOP_ON_FIRST = new Set(["invalid_exact_canton_execute_failed"]);
     let lastReason: string | undefined;
 
     for (let attempt = 0; ; attempt++) {
@@ -215,10 +256,40 @@ export function wrapFetchWithCantonPayment(
         continue;
       }
       const retryHeaders = new Headers(init?.headers);
-      retryHeaders.set(HEADER_PAYMENT_SIGNATURE_V2, encodeBase64Json(envelope));
+      const signatureHeader = encodeBase64Json(envelope);
+      retryHeaders.set(HEADER_PAYMENT_SIGNATURE_V2, signatureHeader);
       const resp = await fetch(input, { ...init, headers: retryHeaders });
-      if (resp.status !== 402) return resp;
+      if (resp.status !== 402) {
+        await throwIfEdgeRejectedPaymentHeader(resp, signatureHeader.length);
+        return resp;
+      }
       const reason = await read402Reason(resp);
+      // AMBIGUITY IS CHECKED FIRST, BEFORE THE RETRY BUDGET.
+      //
+      // Both branches stop; they differ in what they TELL the caller, and on
+      // this reason that difference is the whole point. The exhaustion message
+      // asserts "facilitator rejected the payment" — a definite verdict — and
+      // it used to run first, so an ambiguous reason arriving on the final
+      // attempt was reported as a rejection. An agent or operator acting on
+      // "rejected" pays again for a purchase that may already have settled,
+      // which is exactly the double payment STOP_ON_FIRST exists to prevent.
+      //
+      // The ordering also made the guard unreachable on a whole configuration:
+      // with `maxPaymentRetries: 0` — documented right here as "restores the
+      // old at-most-twice behavior" — `attempt(0) >= maxRetries(0)` is true on
+      // the first 402, so STOP_ON_FIRST never ran at all.
+      //
+      // A re-pay here risks a SECOND real payment, so stop immediately.
+      if (reason !== undefined && STOP_ON_FIRST.has(reason)) {
+        throw new X402PaymentError(
+          `the facilitator could not confirm the payment (${reason}) — it may ` +
+            `already have settled on-ledger, so this client will NOT pay again. ` +
+            `Check the payer's balance / the merchant's receipt before retrying`,
+          "PAYMENT_UNCONFIRMED"
+        );
+      }
+      // Budget spent. Reached only for reasons that are NOT ambiguous, so
+      // "rejected" is a claim this branch is now entitled to make.
       if (attempt >= maxRetries) {
         throw new X402PaymentError(
           `payment retry still returned 402 after ${attempt + 1} attempt(s) — ` +
@@ -281,6 +352,47 @@ function isTransientNetworkError(err: unknown): boolean {
  * reason only ever lets the re-pay loop stop SOONER; it is never required for
  * correctness.
  */
+/**
+ * A 431, or nginx's stock 400 page ("Request Header Or Cookie Too Large"), in
+ * reply to the PAID retry is an edge in front of the merchant refusing the
+ * payment header — not an x402 answer, and not a merchant decision. A real
+ * inline payment header is ~8–10 KiB and the scheme's transport guidance
+ * requires servers to accept at least 16 KiB end to end, so name the fix
+ * instead of handing the caller an opaque error page. The fingerprint is
+ * deliberately tight: a merchant's OWN 400 (bad request body, etc.) carries
+ * neither the 431 status nor nginx's exact phrase and passes through
+ * untouched. The response body is read from a clone, so the caller's stream
+ * stays intact on the pass-through path. Money-safety: the signed payment
+ * never reached the merchant, so nothing settled; it expires on its own
+ * (executeBefore) — this error is safe to re-pay from once the merchant's
+ * edge is fixed.
+ */
+async function throwIfEdgeRejectedPaymentHeader(
+  resp: Response,
+  sentHeaderBytes: number
+): Promise<void> {
+  if (resp.status !== 431 && resp.status !== 400) return;
+  if (resp.status === 400) {
+    let body = "";
+    try {
+      body = await resp.clone().text();
+    } catch {
+      return;
+    }
+    if (!/Request Header Or Cookie Too Large/i.test(body)) return;
+  }
+  throw new X402PaymentError(
+    `the merchant's edge rejected the ${sentHeaderBytes}-byte payment header before the ` +
+      `merchant ever saw it (HTTP ${resp.status}` +
+      (resp.status === 400 ? `, "Request Header Or Cookie Too Large"` : "") +
+      `). An x402 server must accept a payment header of at least 16 KiB end to end — ` +
+      `on nginx: large_client_header_buffers 4 16k; — on a Node origin: ` +
+      `--max-http-header-size=32768. The signed payment never reached the merchant, so ` +
+      `nothing settled; it expires on its own.`,
+    "MERCHANT_HEADER_LIMIT"
+  );
+}
+
 async function read402Reason(resp: Response): Promise<string | undefined> {
   try {
     const text = await resp.text();

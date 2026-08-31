@@ -192,9 +192,14 @@ function inputContractV1(o: {
   signatories?: string[];
   stakeholders?: string[];
 }): Buffer {
+  // Layout CORRECTED against a real MainNet capture: lf_version(1),
+  // contract_id(2), package_name(3), template_id(4). The previous version put
+  // contract_id at 1 and package_name at 2, which was inert while nothing read
+  // contract identity — and would have silently mis-taught any rule that does.
   const created = Buffer.concat([
-    str(1 /* contract_id */, "00ic"),
-    str(2 /* package_name */, "splice-amulet"),
+    str(1 /* lf_version */, "2.1"),
+    str(2 /* contract_id */, "00ic"),
+    str(3 /* package_name */, "splice-amulet"),
     str(4 /* template_id */, "Splice.Amulet:Amulet"),
     len(5 /* create_argument */, o.argument),
     ...(o.signatories ?? []).map((s) => str(6 /* signatories */, s)),

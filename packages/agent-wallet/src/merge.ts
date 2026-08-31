@@ -50,6 +50,8 @@ import type { AgentWallet } from "./store.js";
 import { resolveHashBinding } from "./hash-binding.js";
 import { resolveTrustedDsoParty } from "./trusted-dso.js";
 import { isStaleInputHoldingError } from "./tx.js";
+import { resolveTrustedRegistryParties } from "./registry-parties.js";
+import { sumLedgerDecimals } from "@ftptech/x402-canton-core";
 import type { HashBindingOptions } from "./verify-prepared.js";
 
 /** 1 atomic Amulet, as a ledger Decimal. The self-transfer moves this token
@@ -91,6 +93,17 @@ export interface MergeOptions {
    *  constant; without it a self-transfer carrying the DSO in its consequences
    *  fails closed (see trusted-dso.ts). */
   instrumentAdmin?: string;
+  /** Registry (CIP-56) token to consolidate instead of Canton Coin — the
+   *  instrument id (e.g. "USDCx"); `instrumentAdmin` is then its registrar.
+   *  Enumerates the token's UNLOCKED holdings through the HoldingV1 read
+   *  (`relay.holdings`) and self-transfers each batch for its FULL amount:
+   *  measured on MainNet, a registry self-transfer does not collapse on a
+   *  1-atomic amount (2 inputs → 2 outputs) but does on the full sum (→ 1). */
+  instrumentId?: string;
+  /** Independently-trusted registry parties (operator/bridge) pinned in
+   *  verify-before-sign for a registry merge, exactly like `withdraw`. Defaults
+   *  to the env-resolved set. */
+  trustedRegistryParties?: ReadonlySet<string>;
   /** @internal Injected transfer executor (defaults to the real `transfer`). Lets
    *  unit tests mock the outbound seam and assert receiver === wallet.party on
    *  every call without stubbing the whole relay/prepare/sign chain. */
@@ -177,11 +190,109 @@ async function enumerateHoldingCids(
  * accounting. Every self-transfer pins receiver = wallet.party (verify-before-sign
  * enforced) — whale, chain, and live alike.
  */
+/** Registry-token branch of `merge`. Same invariant (receiver == this wallet,
+ *  enforced by verify-before-sign), different mechanics: there is no Scan
+ *  snapshot / whale pass for a registry token, holdings come from the HoldingV1
+ *  read, and each batch is self-transferred for its FULL sum so the registry
+ *  collapses it into one Holding (see MergeOptions.instrumentId). The ACS is
+ *  re-read after every round, so no output chaining is needed. */
+async function mergeRegistryHoldings(
+  relay: RelayClient,
+  wallet: AgentWallet,
+  opts: MergeOptions,
+  admin: string,
+  id: string
+): Promise<MergeResult> {
+  const target = opts.target ?? 1; // a full-amount self-transfer leaves ONE holding
+  const batchSize = opts.batch ?? 90;
+  const maxRounds = opts.maxRounds ?? 30;
+  const doTransfer = opts.transferFn ?? transfer;
+  const log = opts.onProgress ?? ((): void => {});
+  const hashBinding = opts.hashBinding ?? resolveHashBinding();
+  const trustedRegistryParties =
+    opts.trustedRegistryParties ?? resolveTrustedRegistryParties(admin, process.env);
+
+  const enumerate = async (): Promise<Array<{ cid: string; amount: string }>> => {
+    const h = await relay.holdings(wallet.party, { admin, id });
+    const ins = h.instruments.find((i) => i.admin === admin && i.id === id);
+    return (ins?.holdings ?? []).filter((x) => !x.locked).map(({ cid, amount }) => ({ cid, amount }));
+  };
+
+  let live = await enumerate();
+  const plannedBatches = Math.ceil(live.length / batchSize);
+  if (opts.dryRun) {
+    log(
+      `dry run: ${live.length} unlocked ${id} holding(s) → ${plannedBatches} batch(es) ` +
+        `of up to ${batchSize} → target ${target}. Nothing executed.`
+    );
+    return {
+      rounds: 0,
+      merged: [],
+      updateIds: [],
+      finalHoldings: live.length,
+      usedScan: false,
+      skippedStale: 0,
+      chainedRounds: 0,
+      plannedBatches,
+    };
+  }
+
+  const merged: string[] = [];
+  const updateIds: string[] = [];
+  let rounds = 0;
+  let skippedStale = 0;
+  while (live.length > target && rounds + skippedStale < maxRounds) {
+    const b = live.slice(0, batchSize);
+    const amount = sumLedgerDecimals(b.map((x) => x.amount));
+    try {
+      const updateId = await doTransfer(relay, wallet, {
+        receiver: wallet.party, // SELF-transfer — the non-negotiable invariant.
+        amount, // FULL sum: the registry collapses the batch into one Holding.
+        inputHoldingCids: b.map((x) => x.cid),
+        hashBinding,
+        registryInstrument: true,
+        expectInstrumentAdmin: admin,
+        expectInstrumentId: id,
+        trustedRegistryParties,
+      });
+      rounds++;
+      merged.push(...b.map((x) => x.cid));
+      updateIds.push(updateId);
+      log(`  round ${rounds}: merged ${b.length} ${id} holding(s) (${amount}) → updateId ${updateId}`);
+    } catch (err) {
+      if (!isStaleInputHoldingError(err)) throw err;
+      skippedStale++;
+      log(`  round ${rounds + skippedStale}: stale (already consumed) — re-enumerating`);
+    }
+    live = await enumerate();
+  }
+  if (live.length > target) log(`reached maxRounds (${maxRounds}); ${live.length} holding(s) remain.`);
+  else log(`done: ${live.length} ${id} holding(s) ≤ target ${target}.`);
+  return {
+    rounds,
+    merged,
+    updateIds,
+    finalHoldings: live.length,
+    usedScan: false,
+    skippedStale,
+    chainedRounds: 0,
+  };
+}
+
 export async function mergeHoldings(
   relay: RelayClient,
   wallet: AgentWallet,
   opts: MergeOptions = {}
 ): Promise<MergeResult> {
+  if (opts.instrumentId !== undefined) {
+    if (opts.instrumentAdmin === undefined) {
+      throw new Error("merge: instrumentId needs instrumentAdmin (the token's registrar)");
+    }
+    if (opts.instrumentId === "Amulet") {
+      throw new Error("merge: Amulet is Canton Coin — omit instrumentId to merge CC");
+    }
+    return mergeRegistryHoldings(relay, wallet, opts, opts.instrumentAdmin, opts.instrumentId);
+  }
   const target = opts.target ?? 2;
   const batchSize = opts.batch ?? 90;
   const maxRounds = opts.maxRounds ?? 30;
