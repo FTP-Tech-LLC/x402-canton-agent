@@ -25,6 +25,7 @@ import type {
   CantonPaymentPayload,
 } from "@ftptech/x402-canton-core";
 import type { ExactScheme } from "@ftptech/x402-canton-core";
+import { encodeInlinePaymentPayload } from "@ftptech/x402-canton-core";
 import { wireAmountToLedgerDecimal } from "@ftptech/x402-canton-core";
 import type { CantonSigner } from "./signer.js";
 
@@ -116,10 +117,21 @@ export class ExactCantonScheme {
         resource,
         accepted: requirements,
         payload: {
-          assetTransferMethod: "transfer-factory" as const,
-          payer: signed.payerParty,
-          submissionRef: signed.submissionRef,
-          preparedTxHash: signed.preparedTxHash,
+          // NO `payer` on the wire: the payer would be an untrusted client
+          // claim. The facilitator proves the payer from the signed transaction
+          // (the signer still returns `payerParty`, but it is not emitted here).
+          // The INLINE carriage is the only one: the payload carries the signed
+          // transaction itself, so it resolves at ANY facilitator — which is what
+          // the protocol requires, since the merchant chooses the facilitator and
+          // the payer never learns which one.
+          ...encodeInlinePaymentPayload({
+            preparedTransactionBytes: signed.preparedTransactionBytes,
+            preparedTxHash: signed.preparedTxHash,
+            signatureB64: signed.signatureB64,
+            ...(signed.hashingSchemeVersion
+              ? { hashingSchemeVersion: signed.hashingSchemeVersion }
+              : {}),
+          }),
         },
       };
     }

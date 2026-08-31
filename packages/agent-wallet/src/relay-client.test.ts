@@ -106,6 +106,41 @@ describe("RelayClient", () => {
     expect(r).toEqual({ updateId: "u-fc", amount: "0.02", party: "agent::1220abcd" });
   });
 
+  it("faucetClaim sends X-Faucet-Secret only when a faucetSecret is configured", async () => {
+    // With the secret configured → header present.
+    const withSecret = captureFetch(() =>
+      new Response(
+        JSON.stringify({ updateId: "u", amount: "0.02", party: "agent::1220abcd" }),
+        { status: 200 }
+      )
+    );
+    await new RelayClient({
+      relayUrl: "http://relay",
+      faucetSecret: "shhh",
+    }).faucetClaim("agent::1220abcd");
+    expect(
+      (withSecret.calls[0]!.init.headers as Record<string, string>)[
+        "x-faucet-secret"
+      ]
+    ).toBe("shhh");
+
+    // Without it → no header (works against an un-locked facilitator).
+    const noSecret = captureFetch(() =>
+      new Response(
+        JSON.stringify({ updateId: "u", amount: "0.02", party: "agent::1220abcd" }),
+        { status: 200 }
+      )
+    );
+    await new RelayClient({ relayUrl: "http://relay" }).faucetClaim(
+      "agent::1220abcd"
+    );
+    expect(
+      (noSecret.calls[0]!.init.headers as Record<string, string>)[
+        "x-faucet-secret"
+      ]
+    ).toBeUndefined();
+  });
+
   it("faucetClaim surfaces a relay 503 (faucet disabled / over budget) as a descriptive Error", async () => {
     captureFetch(() => new Response(JSON.stringify({ error: "faucet disabled" }), { status: 503 }));
     await expect(

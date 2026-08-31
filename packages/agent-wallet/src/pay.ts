@@ -10,6 +10,7 @@ import {
   wrapFetchWithCantonPayment,
   peekChosenTransferMethod,
 } from "@ftptech/x402-canton-client";
+import { assetMatches, type PaymentRequirements } from "@ftptech/x402-canton-core";
 import { ensureWallet, type EnsureWalletOpts } from "./onboard.js";
 import { makeRelaySigner } from "./relay-signer.js";
 import { withPayLock } from "./pay-lock.js";
@@ -44,6 +45,52 @@ export interface PayOpts extends EnsureWalletOpts {
    *  to sign if the 402's payTo is anything else (MITM'd-merchant defense).
    *  Omitted → no pin (legacy behavior). */
   expectedPayTo?: string;
+  /**
+   * Pay in the `accepts[]` entry whose asset matches this symbol (e.g.
+   * `"USDCx"`, case-insensitive) when a 402 offers several. An explicitly
+   * requested asset the 402 does not offer FAILS CLOSED (error naming the
+   * offered instruments) — never a silent fallback to the merchant's first
+   * entry. Omitted → today's "first compatible" default, unchanged. This
+   * chooses which instrument to pay in; it is NOT consent to spend it: a
+   * registry token still requires `CANTON_AGENT_PAYABLE_INSTRUMENTS`, and a
+   * preferred-but-unconsented asset fails closed with the usual consent error.
+   */
+  preferAsset?: string;
+}
+
+/**
+ * Build the `selectRequirements` tiebreaker for a preferred asset symbol, or
+ * `undefined` when none is set (so the client keeps its default "first compatible
+ * entry"). Matches by asset symbol (via the x402-ENVELOPE `assetMatches`) or the
+ * structured `instrumentId.id`, case-insensitively. An EXPLICITLY requested
+ * asset the 402 does not offer FAILS CLOSED with the offered list — silently
+ * paying whatever the merchant listed first is exactly the surprise a payer who
+ * named an instrument was trying to rule out. Pure + exported for unit testing.
+ *
+ * @param preferAsset - The asset symbol to prefer, e.g. `"USDCx"`, or undefined.
+ * @returns A selector over the compatible candidates, or undefined.
+ */
+export function buildPreferAssetSelector(
+  preferAsset: string | undefined
+): ((cands: PaymentRequirements[]) => PaymentRequirements) | undefined {
+  if (!preferAsset) return undefined;
+  const want = preferAsset.toLowerCase();
+  return (cands: PaymentRequirements[]): PaymentRequirements => {
+    const hit = cands.find(
+      (a) =>
+        assetMatches(a.asset, preferAsset) ||
+        a.asset.toLowerCase() === want ||
+        a.extra?.instrumentId?.id?.toLowerCase() === want
+    );
+    if (hit) return hit;
+    const offered = [
+      ...new Set(cands.map((a) => a.extra?.instrumentId?.id ?? a.asset)),
+    ].join(", ");
+    throw new Error(
+      `--asset ${preferAsset}: the 402 does not offer that instrument (offered: ${offered}). ` +
+        `Pass one of those, or drop --asset to pay the first offered entry.`
+    );
+  };
 }
 
 export async function makePayingFetch(
@@ -68,7 +115,12 @@ export async function makePayingFetchForWallet(
   wallet: AgentWallet,
   opts: Pick<
     PayOpts,
-    "apiKey" | "hashBinding" | "maxPaymentRetries" | "maxPaymentValue" | "expectedPayTo"
+    | "apiKey"
+    | "hashBinding"
+    | "maxPaymentRetries"
+    | "maxPaymentValue"
+    | "expectedPayTo"
+    | "preferAsset"
   >,
   lockHome?: string
 ): Promise<typeof globalThis.fetch> {
@@ -82,13 +134,15 @@ export async function makePayingFetchForWallet(
       ? { expectedPayTo: opts.expectedPayTo }
       : {}),
   });
-  const paying = wrapFetchWithCantonPayment(
-    globalThis.fetch,
-    signer,
-    opts.maxPaymentRetries !== undefined
+  // When a preferred asset is set, pick the matching accepts[] entry; else the
+  // first compatible entry — identical to the default when no preference is given.
+  const selectRequirements = buildPreferAssetSelector(opts.preferAsset);
+  const paying = wrapFetchWithCantonPayment(globalThis.fetch, signer, {
+    ...(opts.maxPaymentRetries !== undefined
       ? { maxPaymentRetries: opts.maxPaymentRetries }
-      : {}
-  );
+      : {}),
+    ...(selectRequirements ? { selectRequirements } : {}),
+  });
 
   // Probe first WITHOUT the lock — only a request that actually challenges 402
   // enters the per-wallet queue, so non-paid traffic is never delayed. An
@@ -106,7 +160,16 @@ export async function makePayingFetchForWallet(
     const probe = await globalThis.fetch(input, init);
     if (probe.status !== 402) return probe;
     if (lockHome === undefined) return paying(input, init);
-    const method = peekChosenTransferMethod(probe, signer);
+    // The peek must run the SAME selection as the paying fetch — including the
+    // preferred-asset tiebreaker — or the lock decision could be made for one
+    // accepts[] entry while a different one is paid. Today every compatible
+    // entry is transfer-factory, so a divergence would be inert; pinning the
+    // selector here keeps it inert when that stops being true.
+    const method = peekChosenTransferMethod(
+      probe,
+      signer,
+      selectRequirements ? { selectRequirements } : {}
+    );
     // Only serialize when we cannot determine the method (fail-safe). A
     // recognized no-nonce method (transfer-factory) skips the lock.
     const needsSerialization = method === undefined;

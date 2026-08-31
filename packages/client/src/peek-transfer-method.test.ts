@@ -19,8 +19,9 @@ function allSigner(): CantonSigner {
     party: PAYER,
     signTransferFactory: vi.fn().mockResolvedValue({
       payerParty: PAYER,
-      submissionRef: "ref",
-      preparedTxHash: "hash",
+      preparedTxHash: "ab".repeat(32),
+      preparedTransactionBytes: new Uint8Array([1, 2, 3, 4]),
+      signatureB64: Buffer.alloc(64, 1).toString("base64"),
     }),
   };
 }

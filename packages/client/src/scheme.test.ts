@@ -29,7 +29,6 @@ function makeTfRequirements(): PaymentRequirements {
 
 function makeTfSigner(
   result: {
-    submissionRef?: string;
     preparedTxHash?: string;
   } = {}
 ): CantonSigner {
@@ -37,8 +36,9 @@ function makeTfSigner(
     party: PAYER,
     signTransferFactory: vi.fn().mockResolvedValue({
       payerParty: PAYER,
-      submissionRef: result.submissionRef ?? "REF-default",
       preparedTxHash: result.preparedTxHash ?? "aabbccdd",
+      preparedTransactionBytes: new Uint8Array([1, 2, 3, 4]),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
     }),
   };
 }
@@ -101,8 +101,9 @@ describe("ExactCantonScheme — unit-by-scheme amount seam (FEATURE A)", () => {
         seen = input.amount;
         return Promise.resolve({
           payerParty: PAYER,
-          submissionRef: "REF-seam",
           preparedTxHash: "aabb",
+          preparedTransactionBytes: new Uint8Array([1, 2, 3, 4]),
+          signatureB64: Buffer.alloc(64, 7).toString("base64"),
         });
       }),
     };
@@ -173,11 +174,13 @@ describe("ExactCantonScheme transfer-factory (V3) arm", () => {
     };
   }
 
-  it("delegates to signTransferFactory and builds the {payer, submissionRef, preparedTxHash} payload", async () => {
+  it("delegates to signTransferFactory and builds the INLINE payload (no `payer` on the wire)", async () => {
     const sign = vi.fn().mockResolvedValue({
+      // The signer still RETURNS payerParty; the scheme must NOT emit it.
       payerParty: PAYER,
-      submissionRef: "REF-123",
       preparedTxHash: "aabb",
+      preparedTransactionBytes: new Uint8Array([1, 2, 3, 4]),
+      signatureB64: Buffer.alloc(64, 7).toString("base64"),
     });
     const scheme = new ExactCantonScheme({
       party: PAYER,
@@ -186,12 +189,15 @@ describe("ExactCantonScheme transfer-factory (V3) arm", () => {
     const env = await scheme.createPaymentPayload(tfRequirements(), {
       url: "https://api.example.com/x",
     });
-    expect(env.payload).toEqual({
-      assetTransferMethod: "transfer-factory",
-      payer: PAYER,
-      submissionRef: "REF-123",
-      preparedTxHash: "aabb",
-    });
+    const payload = env.payload as Record<string, unknown>;
+    expect(payload.assetTransferMethod).toBe("transfer-factory");
+    expect(payload.preparedTxHash).toBe("aabb");
+    expect(typeof payload.preparedTransaction).toBe("string");
+    expect(typeof payload.signature).toBe("string");
+    // The legacy stash reference must NOT be emitted.
+    expect(payload).not.toHaveProperty("submissionRef");
+    // The untrusted payer claim must NOT travel on the wire.
+    expect(payload).not.toHaveProperty("payer");
     // The signer receives the LEDGER decimal amount (atomic → decimal at the seam).
     const arg = sign.mock.calls[0]![0] as { amount: string; receiver: string };
     expect(arg.receiver).toBe(MERCHANT);
@@ -226,3 +232,61 @@ describe("ExactCantonScheme transfer-factory (V3) arm", () => {
     }
   });
 })
+
+describe("scheme emit — exactly one carriage, inline preferred", () => {
+  const REQ = {
+    scheme: "exact",
+    network: "canton:mainnet",
+    amount: "100000000",
+    asset: "CC",
+    payTo: "merchant::1220" + "ab".repeat(32),
+    maxTimeoutSeconds: 60,
+    extra: {
+      assetTransferMethod: "transfer-factory",
+      feePayer: "fac::1220" + "cd".repeat(32),
+      synchronizerId: "global-domain::1220" + "ef".repeat(32),
+      instrumentId: { admin: "DSO::1220" + "11".repeat(32), id: "Amulet" },
+      executeBeforeSeconds: 60,
+    },
+  } as never;
+  const RESOURCE = { url: "https://api.example.com/x" };
+  const BYTES = Buffer.from("prepared-bytes".repeat(50));
+  const HASH = "1220" + "ab".repeat(32);
+  const SIG = Buffer.alloc(64, 3).toString("base64");
+
+  const signerFor = (signed: Record<string, unknown>) =>
+    ({
+      signTransferFactory: async () => signed,
+    }) as never;
+
+  async function emit(signed: Record<string, unknown>) {
+    const scheme = new ExactCantonScheme(signerFor(signed));
+    const env = await scheme.createPaymentPayload(REQ, RESOURCE);
+    return (env as unknown as { payload: Record<string, unknown> }).payload;
+  }
+
+  it("emits the INLINE carriage when the signer produced bytes", async () => {
+    const payload = await emit({
+      payerParty: "agent::1220" + "22".repeat(32),
+      preparedTxHash: HASH,
+      preparedTransactionBytes: BYTES,
+      signatureB64: SIG,
+    });
+    expect(typeof payload["preparedTransaction"]).toBe("string");
+    expect(payload["signature"]).toBe(SIG);
+    expect(payload["preparedTxHash"]).toBe(HASH);
+    // Never both: a payload naming two transactions has no defensible reading.
+    expect(payload["submissionRef"]).toBeUndefined();
+  });
+
+  it("carries no payer claim on the wire", async () => {
+    // The facilitator proves the payer; a client-supplied one is an assertion.
+    const payload = await emit({
+      payerParty: "agent::1220" + "22".repeat(32),
+      preparedTxHash: HASH,
+      preparedTransactionBytes: BYTES,
+      signatureB64: SIG,
+    });
+    expect(payload["payer"]).toBeUndefined();
+  });
+});

@@ -21,6 +21,16 @@ export interface OnboardPrepareResult {
   onboardingTransactions: string[];
   hashToSign: string;
 }
+export interface HoldingsResult {
+  party: string;
+  instruments: Array<{
+    admin: string;
+    id: string;
+    /** Ledger Decimal string, 10 places. */
+    total: string;
+    holdings: Array<{ cid: string; amount: string; locked: boolean }>;
+  }>;
+}
 export interface BalanceResult {
   party: string;
   amulet: number;
@@ -54,7 +64,15 @@ export interface ResolveAcceptResult {
 }
 export interface PendingResult {
   party: string;
-  pending: Array<{ cid: string; amount?: string; sender?: string }>;
+  pending: Array<{
+    cid: string;
+    amount?: string;
+    sender?: string;
+    /** Set for a registry (CIP-56) instruction; absent on older relays / Amulet. */
+    instrumentId?: { admin: string; id: string };
+    /** ISO instant after which the ledger refuses the accept; absent on older relays. */
+    executeBefore?: string;
+  }>;
 }
 /** The Amulet OUTPUT holdings a transfer transaction created for the party, read
  *  off that transaction by updateId (whale-merge output discovery). Each entry is
@@ -106,7 +124,15 @@ export function isHoldingsExceedNodeLimitError(err: unknown): boolean {
 
 export class RelayClient {
   constructor(
-    private readonly opts: { relayUrl: string; apiKey?: string | undefined }
+    private readonly opts: {
+      relayUrl: string;
+      apiKey?: string | undefined;
+      /** Shared secret for the internal-only faucet route. When set it is sent as
+       *  `X-Faucet-Secret` on faucetClaim so a facilitator that locked its raw
+       *  faucet (CANTON_X402_FAUCET_INTERNAL_SECRET) accepts the call. Used by the
+       *  pay-proxy quest flow, the only trusted faucet caller. */
+      faucetSecret?: string | undefined;
+    }
   ) {}
 
   private headers(): Record<string, string> {
@@ -165,18 +191,30 @@ export class RelayClient {
   submitExecute(b: unknown) {
     return this.req<{ updateId: string }>("POST", "/v1/wallet/submit/execute", b);
   }
-  /** transfer-factory ("V3") pay step 1: the relay BUILDS + interactive-prepares
-   *  the TransferFactory_Transfer and stashes it, returning the prepared bytes +
-   *  hash for the client's verify-before-sign and the small `submissionRef` the
-   *  x402 payload carries. */
+  /** transfer-factory ("V3") pay: the relay BUILDS + interactive-prepares the
+   *  TransferFactory_Transfer and returns the prepared bytes + hash for the
+   *  client's verify-before-sign. The client signs and carries the signed
+   *  transaction INLINE in its x402 payment payload; the relay stores nothing. */
   payPrepare(b: {
     party: string;
     receiver: string;
     amount: string;
     executeBeforeSeconds?: number;
+    /** Merchant-required memo (from PaymentRequirements.extra.memo) the relay
+     *  stamps into the transfer's `x402.memo` meta. Optional — omitted when the
+     *  merchant set none. Forwarded verbatim in the request body. */
+    memo?: string;
+    /** Venue-attribution meta (e.g. `{ "ftp/venue": "ftp/agentic-wallet" }`) the
+     *  relay merges into the prepared transfer's meta alongside `x402.memo`, so a
+     *  token issuer's incentive program can attribute this payment to the venue.
+     *  Keys must end in `/venue`; the relay validates + bounds it. Optional. */
+    venueMeta?: Record<string, string>;
+    /** Non-Amulet CIP-56 instrument to pay in. Omit for Canton Coin. Its admin
+     *  must be configured on the relay (CANTON_X402_TOKEN_REGISTRIES) or the
+     *  relay 400s. */
+    instrumentId?: { admin: string; id: string };
   }) {
     return this.req<{
-      submissionRef: string;
       preparedTransaction: string;
       txHash: string;
       executeBefore: string;
@@ -186,29 +224,23 @@ export class RelayClient {
       instrumentId: { admin: string; id: string };
     }>("POST", "/v1/wallet/pay/prepare", b);
   }
-  /** transfer-factory pay step 2: attach the payer's signing bundle to the
-   *  stashed submission (NO execution — /settle relays it later). */
-  payCommit(b: {
-    party: string;
-    submissionRef: string;
-    hashingSchemeVersion: "HASHING_SCHEME_VERSION_V1" | "HASHING_SCHEME_VERSION_V2";
-    partySignatures: {
-      signatures: Array<{
-        party: string;
-        signatures: Array<Record<string, unknown>>;
-      }>;
-    };
-  }) {
-    return this.req<{ committed: boolean; submissionRef: string; executeBefore: string }>(
-      "POST",
-      "/v1/wallet/pay/commit",
-      b
-    );
-  }
   balance(party: string) {
     return this.req<BalanceResult>(
       "GET",
       `/v1/wallet/${encodeURIComponent(party)}/balance`
+    );
+  }
+  /** Every instrument the party holds, read through the HoldingV1 interface —
+   *  the one read that sees Canton Coin AND any CIP-56 token. `/balance` only
+   *  ever counted Amulet, so a wallet could PAY in USDCx and not SEE it.
+   *  Pass `instrument` to narrow to one {admin,id}. */
+  holdings(party: string, instrument?: { admin: string; id: string }) {
+    const q = instrument
+      ? `?admin=${encodeURIComponent(instrument.admin)}&id=${encodeURIComponent(instrument.id)}`
+      : "";
+    return this.req<HoldingsResult>(
+      "GET",
+      `/v1/wallet/${encodeURIComponent(party)}/holdings${q}`
     );
   }
   /** Merchant TransferPreapproval status (public read). `hasPreapproval:true`
@@ -221,7 +253,20 @@ export class RelayClient {
       merchant: string;
       instrumentId: { admin: string; id: string };
       transferKind: string;
+      /** EXPIRY-AWARE since facilitator e2f6b07: false once the preapproval has
+       *  lapsed, even though the transfer kind stays `direct`. Older relays do
+       *  not send `expiresAt` at all — see below. */
       hasPreapproval: boolean | null;
+      /** ISO-8601 `TransferPreapproval.expiresAt`, read off the contract via
+       *  Scan. ABSENT on a relay that predates the expiry fix, and absent when
+       *  the merchant has no preapproval — callers must treat "missing" as
+       *  "unknown", never as "valid". */
+      expiresAt?: string;
+      /** True when `expiresAt` is in the past. Absent = could not determine. */
+      expired?: boolean;
+      /** Set when Scan could not be read, meaning `hasPreapproval` reflects
+       *  routing only and may be true for an expired preapproval. */
+      expiryNote?: string;
       guidance?: string;
       note?: string;
     }>("GET", `/v1/merchants/${encodeURIComponent(party)}/preapproval-status?${q}`);
@@ -263,6 +308,23 @@ export class RelayClient {
       ...(expiresAt ? { expiresAt } : {}),
     });
   }
+  /** REGISTRY (non-Amulet, e.g. USDCx) self-preapproval, step 1 — the relay
+   *  fetches the registry operator and builds the CreateCommand for the wallet's
+   *  own `Utility.Registry.App.V0.Model.TransferPreapproval`. The wallet then
+   *  verify-before-signs (assertPreparedRegistrySelfPreapproval) and commits via
+   *  the SAME `preapprovalSelfCommit` route. */
+  preapprovalRegistrySelfPrepare(party: string, instrumentId: { admin: string; id: string }) {
+    return this.req<{
+      preparedTransaction: string;
+      hash: string;
+      synchronizerId: string;
+      party: string;
+      operator: string;
+    }>("POST", "/v1/wallet/preapproval/registry/self/prepare", {
+      party,
+      instrumentId,
+    });
+  }
   /** SELF-PROVIDER preapproval, step 2 — submit the merchant-signed prepared
    *  transaction; returns the created preapproval's updateId. */
   preapprovalSelfCommit(body: {
@@ -292,10 +354,13 @@ export class RelayClient {
       `/v1/wallet/${encodeURIComponent(party)}/holdings-scan`
     );
   }
+  /** `registry=1` opts in to registry-token rows (USDCx offers…); without it
+   *  the relay answers Canton Coin instructions only, which is what a client
+   *  that cannot route a registry accept must keep seeing. */
   pending(party: string) {
     return this.req<PendingResult>(
       "GET",
-      `/v1/wallet/${encodeURIComponent(party)}/pending`
+      `/v1/wallet/${encodeURIComponent(party)}/pending?registry=1`
     );
   }
   /** Request a one-time faucet seed for `party` (out-of-box e2e funding). The
@@ -307,7 +372,10 @@ export class RelayClient {
     return this.req<{ updateId: string; amount: string; party: string }>(
       "POST",
       "/v1/wallet/faucet/claim",
-      { party }
+      { party },
+      this.opts.faucetSecret
+        ? { "x-faucet-secret": this.opts.faucetSecret }
+        : undefined
     );
   }
   /** The facilitator's advertised x402 kinds. Used at onboarding to learn the
@@ -324,6 +392,11 @@ export class RelayClient {
     receiver: string;
     amount: string;
     meta?: Record<string, string>;
+    /** Non-Amulet CIP-56 instrument to resolve. Omit for Canton Coin — the
+     *  relay then defaults admin=DSO, id="Amulet". */
+    instrumentId?: { admin: string; id: string };
+    /** Holdings the caller will spend; a registry resolve needs them. */
+    inputHoldingCids?: string[];
   }) {
     return this.req<ResolveFactoryResult>(
       "POST",
@@ -331,7 +404,7 @@ export class RelayClient {
       b
     );
   }
-  resolveAccept(b: { instructionCid: string }) {
+  resolveAccept(b: { instructionCid: string; instrumentAdmin?: string }) {
     return this.req<ResolveAcceptResult>("POST", "/v1/wallet/resolve/accept", b);
   }
   /** Read the Amulet OUTPUT cids a transfer transaction created for `party`, by

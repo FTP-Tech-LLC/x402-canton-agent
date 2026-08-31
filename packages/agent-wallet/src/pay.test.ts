@@ -58,7 +58,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function challenge(): string {
+function challenge(memo?: string): string {
   return encodeBase64Json({
     x402Version: 2,
     resource: { url: RESOURCE },
@@ -77,6 +77,7 @@ function challenge(): string {
           synchronizerId: SYNC,
           instrumentId: { admin: DSO, id: "Amulet" },
           executeBeforeSeconds: 120,
+          ...(memo !== undefined ? { memo } : {}),
         },
       },
     ],
@@ -90,7 +91,7 @@ describe("makePayingFetch (402 → pay → retry)", () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init: { headers?: HeadersInit; body?: string } = {}) => {
-        // ── relay endpoints (transfer-factory pay: prepare → verify → commit) ──
+        // ── relay endpoints (transfer-factory pay: prepare → verify → sign inline) ──
         if (url.includes("/v1/wallet/")) {
           if (url.endsWith("/balance"))
             return new Response(JSON.stringify({ party: PARTY, amulet: 1, cc: "10.0", holdings: [{ cid: "h1", amount: "10.0" }] }), { status: 200 });
@@ -141,7 +142,77 @@ describe("makePayingFetch (402 → pay → retry)", () => {
     // no-nonce method so the per-wallet lock is SKIPPED, but the outer probe is
     // still spent to peek the method — see pay.ts.
     expect(resourceHits).toBe(3);
-    expect(committed).toBe(true); // the signed transfer was stashed for /settle
+    // Inline carriage: the signed transfer travels in the payment payload, so
+    // the relay's pay/commit is never called.
+    expect(committed).toBe(false);
+  });
+
+  it("forwards the merchant's extra.memo to the relay pay/prepare as `memo`", async () => {
+    // The x402 client stamps extra.memo into transferMeta as x402.memo; the relay
+    // signer extracts it and threads it to payViaTransferFactory → relay.payPrepare.
+    let prepareBody: { memo?: unknown } | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: { headers?: HeadersInit; body?: string } = {}) => {
+        if (url.includes("/v1/wallet/")) {
+          if (url.endsWith("/balance"))
+            return new Response(JSON.stringify({ party: PARTY, amulet: 1, cc: "10.0", holdings: [{ cid: "h1", amount: "10.0" }] }), { status: 200 });
+          if (url.endsWith("/pay/prepare")) {
+            const b = JSON.parse(init.body ?? "{}");
+            prepareBody = b;
+            const pt = preparedTransfer(b.receiver, b.amount);
+            return new Response(JSON.stringify({
+              submissionRef: "sub-1", preparedTransaction: pt, txHash: RECOMPUTE(pt),
+              executeBefore: "2026-01-01T00:00:00Z", sender: PARTY, receiver: b.receiver,
+              amount: b.amount, instrumentId: { admin: DSO, id: "Amulet" },
+            }), { status: 200 });
+          }
+          if (url.endsWith("/pay/commit"))
+            return new Response(JSON.stringify({ committed: true, submissionRef: "sub-1", executeBefore: "2026-01-01T00:00:00Z" }), { status: 200 });
+          return new Response("nf", { status: 404 });
+        }
+        const headers = new Headers(init.headers);
+        if (headers.has("payment-signature")) return new Response(JSON.stringify({ data: "premium" }), { status: 200 });
+        return new Response("payment required", { status: 402, headers: { "payment-required": challenge("invoice-7") } });
+      })
+    );
+    const f = await makePayingFetch({ relayUrl: "http://relay", network: "canton:testnet", hashBinding: { recomputeHash: RECOMPUTE } });
+    const res = await f(RESOURCE);
+    expect(res.status).toBe(200);
+    expect(prepareBody?.memo).toBe("invoice-7");
+  });
+
+  it("omits `memo` from pay/prepare when the merchant sets none", async () => {
+    let prepareBody: { memo?: unknown } | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: { headers?: HeadersInit; body?: string } = {}) => {
+        if (url.includes("/v1/wallet/")) {
+          if (url.endsWith("/balance"))
+            return new Response(JSON.stringify({ party: PARTY, amulet: 1, cc: "10.0", holdings: [{ cid: "h1", amount: "10.0" }] }), { status: 200 });
+          if (url.endsWith("/pay/prepare")) {
+            const b = JSON.parse(init.body ?? "{}");
+            prepareBody = b;
+            const pt = preparedTransfer(b.receiver, b.amount);
+            return new Response(JSON.stringify({
+              submissionRef: "sub-1", preparedTransaction: pt, txHash: RECOMPUTE(pt),
+              executeBefore: "2026-01-01T00:00:00Z", sender: PARTY, receiver: b.receiver,
+              amount: b.amount, instrumentId: { admin: DSO, id: "Amulet" },
+            }), { status: 200 });
+          }
+          if (url.endsWith("/pay/commit"))
+            return new Response(JSON.stringify({ committed: true, submissionRef: "sub-1", executeBefore: "2026-01-01T00:00:00Z" }), { status: 200 });
+          return new Response("nf", { status: 404 });
+        }
+        const headers = new Headers(init.headers);
+        if (headers.has("payment-signature")) return new Response(JSON.stringify({ data: "premium" }), { status: 200 });
+        return new Response("payment required", { status: 402, headers: { "payment-required": challenge() } });
+      })
+    );
+    const f = await makePayingFetch({ relayUrl: "http://relay", network: "canton:testnet", hashBinding: { recomputeHash: RECOMPUTE } });
+    await f(RESOURCE);
+    expect(prepareBody).toBeDefined();
+    expect(prepareBody!.memo).toBeUndefined();
   });
 
   it("REFUSES to pay a 402 that quotes ABOVE maxPaymentValue (over-quoting merchant)", async () => {

@@ -19,10 +19,9 @@ export interface CantonSigner {
   /**
    * transfer-factory ("V3", 1-tx meta-transaction): PREPARE + verify-before-sign
    * + SIGN a `TransferFactory_Transfer` (sender = this party, receiver = the
-   * MERCHANT/payTo) and leave it STASHED on the relay; the facilitator relays it
-   * at /settle and pays the GS traffic. Returns the small `submissionRef` the
-   * x402 payload carries (the signed prepared tx is 100s of KB and never travels
-   * in the header). Optional: signers that only support other methods may omit it.
+   * MERCHANT/payTo) and return the signed transaction INLINE; the x402 payload
+   * carries it and the facilitator relays it at /settle (paying the GS traffic).
+   * Optional: signers that only support other methods may omit it.
    */
   signTransferFactory?(
     input: SignTransferFactoryInput
@@ -38,16 +37,24 @@ export interface SignTransferFactoryInput {
   instrumentId: { admin: string; id: string };
   /** Relative deadline (seconds from now) for the transfer's executeBefore. */
   executeBeforeSeconds: number;
-  /** x402 metadata (paymentId, version, memo?) — advisory; the facilitator does
-   *  not match it on this path. */
+  /** x402 metadata stamped into the transfer's meta: `x402.paymentId`,
+   *  `x402.version`, and — when the merchant set PaymentRequirements.extra.memo —
+   *  `x402.memo`. The facilitator ENFORCES `x402.memo` against the merchant's
+   *  required memo on the transfer-factory path (fail-closed at /verify + /settle);
+   *  the other keys are advisory reconciliation aids. */
   transferMeta?: Record<string, string>;
 }
 
 export interface SignedTransferFactory {
   payerParty: string;
-  /** Opaque relay stash reference — the x402 payload's `submissionRef`. */
-  submissionRef: string;
-  /** Hex hash of the prepared tx the payer signed — the payload's
-   *  `preparedTxHash` (binds the ref to the exact signed bytes). */
+  /** Hex hash of the prepared tx the payer signed. It is what the signature is
+   *  over, and the facilitator recomputes it from the bytes to check both. */
   preparedTxHash: string;
+  /** The raw prepared transaction bytes the payer signed — carried INLINE in the
+   *  payment payload, self-contained so any facilitator can relay it. */
+  preparedTransactionBytes: Uint8Array;
+  /** Base64 Ed25519 signature over `preparedTxHash`. Travels with the bytes. */
+  signatureB64: string;
+  /** Canton hashing scheme used for `preparedTxHash`. Defaults to V2. */
+  hashingSchemeVersion?: "HASHING_SCHEME_VERSION_V1" | "HASHING_SCHEME_VERSION_V2";
 }

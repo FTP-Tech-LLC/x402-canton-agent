@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/canton-x402-mcp",
   "private": false,
-  "version": "0.5.0",
+  "version": "1.1.0",
   "description": "MCP server exposing a self-custody Canton x402 agent wallet as tools. A human connects it out-of-band (claude mcp add); read tools auto-allow, pay/withdraw are ask/cap. Thin wrapper over @ftptech/canton-agent-wallet.",
   "license": "Apache-2.0",
   "author": "FTP team",
@@ -31,14 +31,5 @@
   },
   "publishConfig": {
     "access": "public"
-  },
-  "homepage": "https://github.com/sunstrike228/canton-x402-agent/tree/main/packages/mcp#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/sunstrike228/canton-x402-agent.git",
-    "directory": "packages/mcp"
-  },
-  "bugs": {
-    "url": "https://github.com/sunstrike228/canton-x402-agent/issues"
   }
 }

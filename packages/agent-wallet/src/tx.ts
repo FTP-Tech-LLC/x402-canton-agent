@@ -13,11 +13,17 @@ import {
   assertHashBinding,
   assertPreparedTransferMatches,
   assertPreparedSelfPreapproval,
+  assertPreparedRegistrySelfPreapproval,
+  PreparedTransferMismatchError,
   assertPreparedAcceptMatches,
   type HashBindingOptions,
   type PreparedTransferExpectation,
   type PreparedAcceptExpectation,
+  PreparedDecodeError,
+  PreparedHashUnavailableError,
 } from "./verify-prepared.js";
+import { isTrustedRegistryAdmin, resolveTrustedRegistryParties } from "./registry-parties.js";
+import { resolveTrustedDsoParty } from "./trusted-dso.js";
 
 const TI_IFACE =
   "#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction";
@@ -184,15 +190,65 @@ export async function transfer(
      * so this only narrows which of the agent's OWN holdings fund the transfer.
      */
     inputHoldingCids?: string[];
+    /** OUT-OF-BAND-trusted registry infra parties (operator / bridge) for a
+     *  non-Amulet registry token — admitted by the foreign-party backstop. See
+     *  registry-parties.ts. Empty/undefined for Amulet. */
+    trustedRegistryParties?: ReadonlySet<string>;
+    /** NON-Amulet registry instrument: only then is `instrumentId {admin,id}`
+     *  sent to the relay's resolve (which rejects a non-registry admin like the
+     *  DSO). For Amulet leave false — the relay resolves the DSO itself, and
+     *  `expectInstrumentAdmin` still pins it in verify-before-sign. */
+    registryInstrument?: boolean;
+    /** Opt into the registry two-step transfer-offer shape (receiver has no
+     *  preapproval) — threaded to verify-before-sign. Only a caller that means to
+     *  send a registry token to a non-preapproved receiver (a swap to a pool) sets
+     *  this. See PreparedTransferExpectation.allowRegistryOffer. */
+    allowRegistryOffer?: boolean;
   }
 ): Promise<string> {
+  // `/balance` enumerates AMULET holdings only (its filter names
+  // Splice.Amulet:Amulet), so the default below can only ever produce Canton
+  // Coin contract ids. Handing those to a registry token's factory is the same
+  // shape of mistake as sending it an empty list — the registry is asked to
+  // spend inputs that are not its instrument — and it is worse than an error
+  // because nothing here says so. This entry point is exported from the
+  // published package, so a caller has no way to know.
+  //
+  // Selecting registry inputs is the relay's job (it reads the HoldingV1
+  // interface view for the instrument); this helper cannot do it. So it refuses
+  // rather than guesses: name the holdings explicitly, or use the pay path that
+  // resolves them properly.
+  if (opts.registryInstrument === true && opts.inputHoldingCids === undefined) {
+    throw new Error(
+      "transfer(): registryInstrument needs explicit inputHoldingCids — the " +
+        "default comes from /balance, which enumerates Amulet holdings only, " +
+        "so it would hand a registry factory Canton Coin contract ids"
+    );
+  }
   const inputHoldingCids =
     opts.inputHoldingCids ?? (await relay.balance(wallet.party)).holdings.map((h) => h.cid);
   const f = await relay.resolveTransferFactory({
     sender: wallet.party,
     receiver: opts.receiver,
     amount: opts.amount,
+    // The registry needs to see the inputs to resolve the kind; the SV Scan
+    // ignores them. Sent always: harmless for Amulet, required for a token.
+    inputHoldingCids,
     ...(opts.meta ? { meta: opts.meta } : {}),
+    // Non-Amulet CIP-56 ONLY: name the instrument so the relay resolves it on the
+    // right registry. Amulet omits it (the relay rejects a non-registry admin like
+    // the DSO); the DSO is still pinned in verify-before-sign via
+    // `expectInstrumentAdmin`.
+    ...(opts.registryInstrument &&
+    opts.expectInstrumentId &&
+    opts.expectInstrumentAdmin
+      ? {
+          instrumentId: {
+            admin: opts.expectInstrumentAdmin,
+            id: opts.expectInstrumentId,
+          },
+        }
+      : {}),
   });
   const now = Date.now();
   const ex = {
@@ -245,6 +301,10 @@ export async function transfer(
         ...(opts.expectInstrumentAdmin !== undefined
           ? { instrumentAdmin: opts.expectInstrumentAdmin }
           : {}),
+        ...(opts.trustedRegistryParties !== undefined
+          ? { trustedRegistryParties: opts.trustedRegistryParties }
+          : {}),
+        ...(opts.allowRegistryOffer === true ? { allowRegistryOffer: true } : {}),
         nowMs: Date.now(),
       },
     },
@@ -254,17 +314,16 @@ export async function transfer(
 }
 
 /**
- * transfer-factory ("V3") pay: PREPARE + VERIFY-BEFORE-SIGN + SIGN + COMMIT a
- * relay-built `TransferFactory_Transfer` to the merchant, leaving it STASHED on
- * the relay (the facilitator relays it later at /settle). Returns the small
- * `submissionRef` the x402 payload carries.
+ * transfer-factory ("V3") pay: PREPARE + VERIFY-BEFORE-SIGN + SIGN a relay-built
+ * `TransferFactory_Transfer` to the merchant, and return the signed bytes for the
+ * INLINE carriage — the x402 payment payload carries them, so any facilitator can
+ * relay them at /settle. The relay stores nothing.
  *
  * Same security recipe as `prepareSignExecute` — `assertPreparedTransferMatches`
  * pins the relay-built transfer to CALLER INTENT (sender = self, receiver =
  * payTo, amount, instrument), then `assertHashBinding` proves the signed hash is
- * the hash of those validated bytes — but it COMMITS (attaches the signature to
- * the stash) instead of executing, because the facilitator (not the payer) is
- * the submitter on this path.
+ * the hash of those validated bytes. It does not execute: the facilitator (not
+ * the payer) is the submitter, and it does so later from the inline payload.
  */
 export async function payViaTransferFactory(
   relay: RelayClient,
@@ -278,14 +337,64 @@ export async function payViaTransferFactory(
     /** Optional independently-trusted instrument admin (DSO) to pin. */
     expectInstrumentAdmin?: string;
     hashBinding?: HashBindingOptions;
+    /** Merchant-required memo (PaymentRequirements.extra.memo) to stamp into the
+     *  relay-prepared transfer's `x402.memo` meta. Advisory / NOT money-critical:
+     *  verify-before-sign deliberately does NOT pin the transfer meta (see the
+     *  payPrepare call below), so a relay that alters/drops the memo can only make
+     *  the merchant's /verify reject the payment — it can never redirect funds. */
+    memo?: string;
+    /** Venue-attribution meta to stamp into the relay-prepared transfer's meta
+     *  alongside `x402.memo` (e.g. `{ "ftp/venue": "ftp/agentic-wallet" }`). Set by
+     *  the signer for a registry-token payment when the wallet configures a venue
+     *  tag; advisory, forwarded to the relay's pay/prepare. Omitted → no venue tag. */
+    venueMeta?: Record<string, string>;
+    /** OUT-OF-BAND-trusted registry infra parties (operator / bridge) for a
+     *  non-Amulet registry token — admitted by the foreign-party backstop. See
+     *  registry-parties.ts. Empty/undefined for Amulet. */
+    trustedRegistryParties?: ReadonlySet<string>;
+    /** Whether this is a NON-Amulet registry instrument. Only then is
+     *  `instrumentId {admin,id}` sent to the relay's pay/prepare so it resolves on
+     *  that registry — the relay rejects a supplied admin that is not a configured
+     *  registry (Amulet's DSO admin is not one). For Amulet leave false/undefined:
+     *  the relay resolves the DSO itself, and `expectInstrumentAdmin` still pins
+     *  the DSO in verify-before-sign (the two uses are deliberately decoupled). */
+    registryInstrument?: boolean;
   }
-): Promise<{ payerParty: string; submissionRef: string; txHash: string }> {
+): Promise<{
+  payerParty: string;
+  txHash: string;
+  /** `txHash` re-encoded as the scheme's hex wire form. */
+  preparedTxHashHex: string;
+  /** The signed prepared transaction bytes the payment payload carries inline. */
+  preparedTransactionBytes: Uint8Array;
+  signatureB64: string;
+  hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2";
+}> {
   const prep = await relay.payPrepare({
     party: wallet.party,
     receiver: opts.receiver,
     amount: opts.amount,
     ...(opts.executeBeforeSeconds !== undefined
       ? { executeBeforeSeconds: opts.executeBeforeSeconds }
+      : {}),
+    ...(opts.memo !== undefined ? { memo: opts.memo } : {}),
+    ...(opts.venueMeta && Object.keys(opts.venueMeta).length > 0
+      ? { venueMeta: opts.venueMeta }
+      : {}),
+    // Non-Amulet CIP-56 ONLY: name the instrument so the relay resolves it on the
+    // token's registry (needs both halves). For Amulet this is omitted — the relay
+    // rejects a supplied admin that is not a configured registry (the DSO is not
+    // one), and the DSO is still pinned in verify-before-sign via
+    // `expectInstrumentAdmin` below.
+    ...(opts.registryInstrument &&
+    opts.expectInstrumentId &&
+    opts.expectInstrumentAdmin
+      ? {
+          instrumentId: {
+            admin: opts.expectInstrumentAdmin,
+            id: opts.expectInstrumentId,
+          },
+        }
       : {}),
   });
   const preparedTransaction = prep.preparedTransaction;
@@ -298,35 +407,29 @@ export async function payViaTransferFactory(
     ...(opts.expectInstrumentAdmin !== undefined
       ? { instrumentAdmin: opts.expectInstrumentAdmin }
       : {}),
+    ...(opts.trustedRegistryParties !== undefined
+      ? { trustedRegistryParties: opts.trustedRegistryParties }
+      : {}),
     nowMs: Date.now(),
   });
   // Hash binding: the hash we sign MUST be the hash of the validated bytes.
   await assertHashBinding(preparedTransaction, prep.txHash, opts.hashBinding ?? {});
   const signature = signHashB64(prep.txHash, wallet.privateKeyPkcs8Pem);
-  await relay.payCommit({
-    party: wallet.party,
-    submissionRef: prep.submissionRef,
-    hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
-    partySignatures: {
-      signatures: [
-        {
-          party: wallet.party,
-          signatures: [
-            {
-              format: "SIGNATURE_FORMAT_CONCAT",
-              signature,
-              signingAlgorithmSpec: "SIGNING_ALGORITHM_SPEC_ED25519",
-              signedBy: wallet.publicKeyFingerprint,
-            },
-          ],
-        },
-      ],
-    },
-  });
+
+  // Hand the caller the signed bytes. Nothing is sent back to the relay — it
+  // stored nothing, and the payment payload carries the transaction. Both legs
+  // of verify-before-sign already ran above, so what is returned here is bytes
+  // this wallet validated and a signature over the hash OF those bytes.
   return {
     payerParty: wallet.party,
-    submissionRef: prep.submissionRef,
     txHash: prep.txHash,
+    preparedTransactionBytes: Buffer.from(preparedTransaction, "base64"),
+    // Canton hands us the hash BASE64; the scheme's wire form is hex. The
+    // conversion is explicit here rather than guessed by the encoder, because
+    // a value that is valid in both alphabets must never be auto-detected.
+    preparedTxHashHex: Buffer.from(prep.txHash, "base64").toString("hex"),
+    signatureB64: signature,
+    hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
   };
 }
 
@@ -457,12 +560,70 @@ export async function claimAll(
   relay: RelayClient,
   wallet: AgentWallet,
   opts: { hashBinding?: HashBindingOptions } = {}
-): Promise<{ claimed: number; updateIds: string[] }> {
+): Promise<{
+  claimed: number;
+  updateIds: string[];
+  /** Instructions left alone because their executeBefore has passed; the
+   *  ledger would refuse the accept, so attempting it only burns a prepare. */
+  skippedExpired: number;
+  /** Instructions whose accept failed; the others were still attempted. */
+  failed: Array<{ cid: string; error: string }>;
+  /** Offers of a token whose registrar this wallet has no trust anchor for
+   *  (KNOWN_REGISTRY_TRUSTED_PARTIES / CANTON_AGENT_REGISTRY_TRUSTED_PARTIES).
+   *  The agent cannot refuse to be SENT a token, but it refuses to ACT on one
+   *  it cannot verify: such a row is left alone, named here, and never
+   *  reaches prepare — so an honest-but-unanchored offer cannot trip
+   *  verify-before-sign and stop the Canton Coin rows behind it. */
+  skippedUntrusted: Array<{ cid: string; admin: string }>;
+}> {
   const hashBinding = opts.hashBinding ?? resolveHashBinding();
   const { pending } = await relay.pending(wallet.party);
   const updateIds: string[] = [];
+  const failed: Array<{ cid: string; error: string }> = [];
+  const skippedUntrusted: Array<{ cid: string; admin: string }> = [];
+  const trustedDso = resolveTrustedDsoParty(process.env, wallet.network);
+  let skippedExpired = 0;
+  const nowMs = Date.now();
   for (const p of pending) {
-    const ctx = await relay.resolveAccept({ instructionCid: p.cid });
+    // ONE BAD INSTRUCTION MUST NOT BLOCK THE REST. This loop used to throw on
+    // the first failure, and pending is ordered oldest-first — so a single
+    // expired offer (the ledger answers deadline-exceeded to its accept) made
+    // every newer, perfectly claimable one unreachable. Measured live: three
+    // expired USDCx offers ahead of one live one, claim failed, balance stayed
+    // 0. Expired ones are skipped up front when the relay reports
+    // executeBefore; anything else that fails is recorded and the loop goes on.
+    if (p.executeBefore !== undefined && Date.parse(p.executeBefore) <= nowMs) {
+      skippedExpired += 1;
+      continue;
+    }
+    // A registry instruction's accept context lives on ITS registry, not the
+    // SV Scan. /pending names the instrument on EVERY row (the
+    // TransferInstructionV1 view always carries one — for Canton Coin it is the
+    // DSO + "Amulet"), so the admin is forwarded only for a registry token; an
+    // Amulet row keeps the SV Scan path it always had.
+    // Canton Coin is recognised by the LOCAL DSO anchor, not by the row's own
+    // label: a registrar that names a token "Amulet" is still a registrar.
+    // Without a known DSO for this network the id is all there is to go on.
+    const isCantonCoin =
+      p.instrumentId === undefined ||
+      (p.instrumentId.id === "Amulet" &&
+        (trustedDso === undefined || p.instrumentId.admin === trustedDso));
+    const registryAdmin = isCantonCoin ? undefined : p.instrumentId!.admin;
+    // The trust anchor for a registry claim is LOCAL (the baked-in table or
+    // the operator's env), never the relay's row. A registrar this wallet has
+    // no anchor for cannot be verified — the honest accept names the registry
+    // operator and bridge, which verify would rightly call foreign — so the
+    // row is skipped here instead of being prepared and refused (a refusal is
+    // treated as evidence about the relay and stops the loop).
+    if (registryAdmin !== undefined && !isTrustedRegistryAdmin(registryAdmin, process.env)) {
+      skippedUntrusted.push({ cid: p.cid, admin: registryAdmin });
+      continue;
+    }
+    try {
+    const ctx = await relay.resolveAccept({
+      instructionCid: p.cid,
+      ...(registryAdmin !== undefined ? { instrumentAdmin: registryAdmin } : {}),
+    });
     const ex = {
       ExerciseCommand: {
         templateId: TI_IFACE,
@@ -481,12 +642,50 @@ export async function claimAll(
         ctx.disclosedContracts,
         // VERIFY-before-sign: the prepared tx MUST be a single inbound accept by
         // the agent — never a relay-injected outbound drain.
-        { kind: "accept", expect: { selfParty: wallet.party, nowMs: Date.now() } },
+        {
+          kind: "accept",
+          expect: {
+            selfParty: wallet.party,
+            nowMs: Date.now(),
+            // A registry claim DECLARES its token: that is what admits the
+            // registry two-step accept node, and the created holding is then
+            // held to {agent, registrar, trusted registry parties}. A Canton
+            // Coin claim declares nothing and keeps the Amulet-only whitelist.
+            ...(registryAdmin !== undefined
+              ? {
+                  instrumentAdmin: registryAdmin,
+                  trustedRegistryParties: resolveTrustedRegistryParties(registryAdmin, process.env),
+                }
+              : {}),
+          },
+        },
         hashBinding
       )
     );
+    } catch (err) {
+      // NOT EVERY FAILURE IS ONE ROW'S PROBLEM. prepareSignExecute runs
+      // submitPrepare → verify-before-sign → hash-binding → sign → execute.
+      // A refusal from the VERIFY step means the relay handed back bytes that
+      // are not the accept we asked for — a drain, a tampered hash, an
+      // unbindable binding. That is evidence about the RELAY, not about this
+      // instruction, and the next row would be prepared by the same relay. It
+      // must stop the whole claim, exactly as before; the security suites pin
+      // that ("REJECTS an OUTBOUND DRAIN", "REFUSES with NO binding"). Only a
+      // failure AFTER an honest transaction was signed — the ledger refusing
+      // it, a transport error — is isolated to its row.
+      if (
+        err instanceof PreparedTransferMismatchError ||
+        err instanceof PreparedDecodeError ||
+        err instanceof PreparedHashUnavailableError
+      ) {
+        throw err;
+      }
+      failed.push({ cid: p.cid, error: err instanceof Error ? err.message : String(err) });
+    }
   }
-  return { claimed: pending.length, updateIds };
+  // `claimed` is what actually landed, not what was pending — the old value
+  // reported every row as claimed even when the call had thrown.
+  return { claimed: updateIds.length, updateIds, skippedExpired, failed, skippedUntrusted };
 }
 
 /**
@@ -507,7 +706,7 @@ const SELF_PREAPPROVAL_STALE_BACKOFF_MS = [1000, 2000, 4000, 8000, 12000];
 export async function selfProvisionPreapproval(
   relay: RelayClient,
   wallet: AgentWallet,
-  opts?: { expiresAt?: string },
+  opts?: { expiresAt?: string; hashBinding?: HashBindingOptions },
   sleep: (ms: number) => Promise<void> = (ms) =>
     new Promise((r) => setTimeout(r, ms))
 ): Promise<{ updateId: string }> {
@@ -517,7 +716,45 @@ export async function selfProvisionPreapproval(
   const attempt = async (): Promise<{ updateId: string }> => {
     const prep = await relay.preapprovalSelfPrepare(wallet.party, opts?.expiresAt);
     // Never sign a relay tx that does anything other than create OUR preapproval.
-    assertPreparedSelfPreapproval(prep.preparedTransaction, wallet.party);
+    // `prep.expiresAt` is the relay's OWN statement of the horizon it built.
+    // Passing it back binds the bytes to that statement: a relay that says 90
+    // days and encodes ten years is caught, and a caller who asked for a
+    // specific date gets it checked below.
+    assertPreparedSelfPreapproval(
+      prep.preparedTransaction,
+      wallet.party,
+      prep.expiresAt
+    );
+    if (opts?.expiresAt !== undefined && prep.expiresAt !== opts.expiresAt) {
+      throw new PreparedTransferMismatchError(
+        `self-preapproval: asked for expiresAt ${JSON.stringify(opts.expiresAt)} but the relay ` +
+          `built ${JSON.stringify(prep.expiresAt)} — refusing to sign`
+      );
+    }
+    // ...and never sign a hash that is not the hash OF THOSE BYTES.
+    //
+    // Validating the bytes and then signing the relay's `txHash` is two
+    // unconnected acts: a lying relay sends honest bytes — which pass the
+    // assertion above — together with the hash of a completely different
+    // transaction, and the wallet signs that other transaction. Every other
+    // signing path in this file binds the two (lines 120 and 336); this was
+    // the one that did not, which made the structural check above decorative
+    // on exactly the path where the wallet signs with its own key and no
+    // facilitator delegation stands in the way.
+    // `?? resolveHashBinding()`, NOT `?? {}`. The `{}` form is correct only for
+    // the INNER helpers (prepareSignExecute, the transfer-factory pay path),
+    // whose public entry points — claimAll, makeRelaySigner, withdraw — have
+    // already resolved a real recompute before calling down. This function IS a
+    // public entry point: every caller (the `preapproval` CLI command and all
+    // the e2e drivers) passes no hashBinding, so `{}` here means "no recompute
+    // available" and the binding assert fails closed on the honest path —
+    // turning a silent blind-sign into a hard-broken command. resolveHashBinding
+    // supplies the participant-conformant V2 recompute by default.
+    await assertHashBinding(
+      prep.preparedTransaction,
+      prep.txHash,
+      opts?.hashBinding ?? resolveHashBinding()
+    );
     const signature = signHashB64(prep.txHash, wallet.privateKeyPkcs8Pem);
     return relay.preapprovalSelfCommit({
       party: wallet.party,
@@ -559,4 +796,72 @@ export async function selfProvisionPreapproval(
       throw err;
     }
   }
+}
+
+/**
+ * SELF-PROVISION a registry (non-Amulet CIP-56, e.g. USDCx) TransferPreapproval so
+ * this wallet can RECEIVE that token one-shot (direct). The registry analogue of
+ * {@link selfProvisionPreapproval}: the relay fetches the registry operator and
+ * builds the plain CREATE of the wallet's own
+ * `Utility.Registry.App.V0.Model.TransferPreapproval` (no fee, no mining rounds),
+ * the wallet VERIFY-BEFORE-SIGNs it (assertPreparedRegistrySelfPreapproval — the
+ * only parties allowed are the wallet, the instrument admin, and the out-of-band
+ * trusted registry infra), signs with its OWN key, and commits via the shared
+ * self/commit route. The instrument admin must be a configured registry on the
+ * relay AND a known/configured trusted registry on the client (so the operator is
+ * an out-of-band-trusted party, never blind-trusted from the relay).
+ */
+export async function selfProvisionRegistryPreapproval(
+  relay: RelayClient,
+  wallet: AgentWallet,
+  opts: {
+    instrumentId: { admin: string; id: string };
+    hashBinding?: HashBindingOptions;
+  }
+): Promise<{ updateId: string }> {
+  const { admin, id } = opts.instrumentId;
+  const trustedRegistryParties = resolveTrustedRegistryParties(admin, process.env);
+  if (trustedRegistryParties.size === 0) {
+    throw new PreparedTransferMismatchError(
+      `registry self-preapproval: instrument admin ${JSON.stringify(admin)} has no out-of-band ` +
+        `trusted registry parties (set CANTON_AGENT_REGISTRY_TRUSTED_PARTIES or use a known ` +
+        `registry) — refusing to sign a relay-built create with no trust anchor`
+    );
+  }
+  const prep = await relay.preapprovalRegistrySelfPrepare(wallet.party, { admin, id });
+  // Never sign a relay tx that does anything other than create OUR registry
+  // preapproval, or that names any party beyond {us, admin, trusted registry infra}.
+  assertPreparedRegistrySelfPreapproval(prep.preparedTransaction, {
+    party: wallet.party,
+    admin,
+    trustedRegistryParties,
+  });
+  // ...and never sign a hash that is not the hash OF THOSE BYTES (real V2 recompute
+  // by default; this is a public entry point, like selfProvisionPreapproval).
+  await assertHashBinding(
+    prep.preparedTransaction,
+    prep.hash,
+    opts.hashBinding ?? resolveHashBinding()
+  );
+  const signature = signHashB64(prep.hash, wallet.privateKeyPkcs8Pem);
+  return relay.preapprovalSelfCommit({
+    party: wallet.party,
+    preparedTransaction: prep.preparedTransaction,
+    hashingSchemeVersion: "HASHING_SCHEME_VERSION_V2",
+    partySignatures: {
+      signatures: [
+        {
+          party: wallet.party,
+          signatures: [
+            {
+              format: "SIGNATURE_FORMAT_CONCAT",
+              signature,
+              signingAlgorithmSpec: "SIGNING_ALGORITHM_SPEC_ED25519",
+              signedBy: wallet.publicKeyFingerprint,
+            },
+          ],
+        },
+      ],
+    },
+  });
 }
