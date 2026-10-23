@@ -10,7 +10,12 @@ import { transfer } from "./tx.js";
 import { resolveHashBinding } from "./hash-binding.js";
 import { resolveTrustedRegistryParties } from "./registry-parties.js";
 import { venueMetaForInstrument } from "./venue.js";
-import { sumLedgerDecimals, compareLedgerDecimals } from "@ftptech/x402-canton-core";
+import {
+  sumLedgerDecimals,
+  compareLedgerDecimals,
+  decimalToAtomicCC,
+} from "@ftptech/x402-canton-core";
+import { MAX_TRANSFER_INPUTS_REGISTRY } from "@ftptech/x402-canton-ledger";
 import { resolveTrustedDsoParty } from "./trusted-dso.js";
 import type { HashBindingOptions } from "./verify-prepared.js";
 
@@ -48,7 +53,8 @@ export interface WithdrawOpts {
   /** Arbitrary on-ledger transfer meta to stamp onto the outgoing transfer.
    *  Used by the `swap` command to carry a pool's minimum-output value in the
    *  key the AMM parses. Advisory / not money-critical (verify-before-sign does
-   *  not pin transfer meta); omitted → no meta, exactly as before. */
+   *  not pin transfer meta); omitted → only the venue tag on a registry token
+   *  (see venue.ts), no meta on Canton Coin. */
   meta?: Record<string, string>;
   /** Allow the registry two-step transfer-offer shape when the receiver has no
    *  preapproval (a swap to a Tradecraft pool). Threaded to verify-before-sign;
@@ -57,9 +63,21 @@ export interface WithdrawOpts {
   allowRegistryOffer?: boolean;
 }
 
+function assertPositive(amount: string): void {
+  let positive = false;
+  try {
+    positive = compareLedgerDecimals(amount, "0") > 0;
+  } catch {
+    positive = false;
+  }
+  if (!positive) {
+    throw new Error(`withdraw amount must be a positive number (got ${JSON.stringify(amount)})`);
+  }
+}
+
 export async function withdraw(
   opts: WithdrawOpts
-): Promise<{ updateId: string; amount: string }> {
+): Promise<{ updateId: string; amount: string; landed: boolean | null }> {
   const wallet = opts.wallet ?? loadWallet();
   if (!wallet) throw new Error("no wallet — run `create` first");
   const relay =
@@ -91,44 +109,86 @@ export async function withdraw(
   let available: string;
   let inputCids: string[] | undefined;
   let unit: string;
+  let amount: string;
   if (isRegistry) {
-    const h = await relay.holdings(wallet.party, {
-      admin: opts.instrumentAdmin!,
-      id: opts.instrumentId!,
-    });
+    // BOUNDED read, narrowed by the relay to this token: a wallet whose
+    // holdings of it cannot all be listed in one read gets part of them
+    // (complete:false) instead of a 413 — other tokens' dust no longer counts.
+    // That is enough to SPEND from, never enough to know the balance — so a
+    // full withdraw, or a shortfall, on an incomplete read points at `merge`
+    // instead of quoting a number that is only a lower bound.
+    const h = await relay.holdings(
+      wallet.party,
+      { admin: opts.instrumentAdmin!, id: opts.instrumentId! },
+      { slice: true }
+    );
+    const { complete } = h;
     const ins = h.instruments[0];
     const spendable = (ins?.holdings ?? []).filter((x) => !x.locked);
     // Exact sum: a float total can land an atomic ABOVE what the wallet holds,
     // and that number is both the transfer amount and the pre-flight guard.
     available = sumLedgerDecimals(spendable.map((x) => x.amount));
-    inputCids = spendable.map((x) => x.cid);
     unit = opts.instrumentId!;
+    const mergeHint =
+      `canton-agent-wallet merge --admin ${opts.instrumentAdmin} --id ${opts.instrumentId}` +
+      ` (or --all-tokens)`;
+    if (opts.amount === undefined && !complete) {
+      throw new Error(
+        `withdraw: this wallet holds more ${unit} holdings than the participant lists in one read, ` +
+          `so its full balance is not known. Consolidate first with: ${mergeHint} — or pass --amount.`
+      );
+    }
+    amount = opts.amount ?? available;
+    assertPositive(amount);
+    if (compareLedgerDecimals(amount, available) > 0) {
+      throw new Error(
+        complete
+          ? `insufficient funds: wallet balance is ${available} ${unit} but ${amount} ${unit} was requested`
+          : `withdraw: only ${available} ${unit} is visible among this wallet's oldest holdings — it ` +
+              `holds more than the participant lists in one read. Consolidate first with: ${mergeHint}`
+      );
+    }
+    // The fewest holdings that cover the amount, largest first: the registry
+    // returns the rest as change, and a transaction may spend at most
+    // MAX_TRANSFER_INPUTS_REGISTRY before it hits the 256-node cap.
+    const byAmount = [...spendable].sort((a, b) => {
+      const d = BigInt(decimalToAtomicCC(b.amount)) - BigInt(decimalToAtomicCC(a.amount));
+      return d > 0n ? 1 : d < 0n ? -1 : 0;
+    });
+    const want = BigInt(decimalToAtomicCC(amount));
+    // The cap binds only when choosing from a slice; a complete read keeps the
+    // old behaviour and may spend every holding it needs.
+    const maxInputs = complete ? Number.POSITIVE_INFINITY : MAX_TRANSFER_INPUTS_REGISTRY;
+    const picked: typeof spendable = [];
+    let got = 0n;
+    for (const x of byAmount) {
+      if (got >= want || picked.length >= maxInputs) break;
+      picked.push(x);
+      got += BigInt(decimalToAtomicCC(x.amount));
+    }
+    if (got < want) {
+      throw new Error(
+        `withdraw: ${amount} ${unit} is spread over more than ${MAX_TRANSFER_INPUTS_REGISTRY} holdings, more ` +
+          `than one transfer can spend. Consolidate first with: ${mergeHint}`
+      );
+    }
+    inputCids = picked.map((x) => x.cid);
   } else {
     const bal = await relay.balance(wallet.party);
     available = bal.cc;
     unit = "CC";
-  }
-  const amount = opts.amount ?? available;
-  let positive = false;
-  try {
-    positive = compareLedgerDecimals(amount, "0") > 0;
-  } catch {
-    positive = false;
-  }
-  if (!positive) {
-    throw new Error(
-      `withdraw amount must be a positive number (got ${JSON.stringify(amount)})`
-    );
-  }
-  if (compareLedgerDecimals(amount, available) > 0) {
-    throw new Error(
-      `insufficient funds: wallet balance is ${available} ${unit} but ${amount} ${unit} was requested`
-    );
+    amount = opts.amount ?? available;
+    assertPositive(amount);
+    if (compareLedgerDecimals(amount, available) > 0) {
+      throw new Error(
+        `insufficient funds: wallet balance is ${available} ${unit} but ${amount} ${unit} was requested`
+      );
+    }
   }
   const instrumentAdmin =
     opts.instrumentAdmin ?? resolveTrustedDsoParty(process.env, wallet.network);
-  // Attribution: stamp the issuer's `/venue` key when withdrawing an attributed
-  // registry token (CBTC). Keyed off the RAW opts instrument (not the DSO-resolved
+  // Attribution: stamp the `/venue` tag (on by default) when withdrawing a
+  // registry token. Keyed off the RAW opts instrument (not the DSO-resolved
   // `instrumentAdmin` above), so a CC withdraw — opts.instrumentAdmin undefined —
   // never carries it. Merged UNDER any caller meta, so an explicit key wins and the
   // swap's slippage memo (a different key) survives alongside it.
@@ -155,5 +215,36 @@ export async function withdraw(
         }
       : {}),
   });
-  return { updateId, amount };
+  // DID IT ACTUALLY LAND? A transfer to a receiver holding a TransferPreapproval
+  // settles DIRECT — the funds are in their wallet when this returns. Without one
+  // it settles as a pending OFFER the receiver must `claim`, and until they do,
+  // the money is on-ledger but NOT spendable by them. Reporting both as a bare
+  // "withdrew N to <party>" reads as delivery in the case where nothing has been
+  // delivered yet, so the caller is told which happened.
+  //
+  // Queried AFTER the send: the transfer has already committed, so a failure here
+  // can only cost us the label, never the money. `hasPreapproval` is tri-state and
+  // `null` means the relay could not say (an older relay omits `expiresAt` and
+  // answers null) — that is UNKNOWN, never "landed", so it is passed through as
+  // null and the caller stays silent rather than claiming either outcome.
+  //
+  // The instrument must be NAMED to ask: for Canton Coin that is the resolved DSO
+  // (which `resolveTrustedDsoParty` may not know for an unconfigured network) and
+  // for a registry token the registrar. With no admin in hand the question cannot
+  // be posed, so it stays unknown rather than guessed.
+  const statusAdmin = isRegistry ? opts.instrumentAdmin : instrumentAdmin;
+  let landed: boolean | null = null;
+  if (statusAdmin !== undefined) {
+    try {
+      const st = await relay.preapprovalStatus(
+        opts.to,
+        statusAdmin,
+        isRegistry ? opts.instrumentId! : "Amulet"
+      );
+      landed = st.hasPreapproval;
+    } catch {
+      landed = null; // unreachable/older relay: unknown, not "delivered"
+    }
+  }
+  return { updateId, amount, landed };
 }

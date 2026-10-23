@@ -6,6 +6,13 @@
  * `process.exit`). `cli.ts` composes these with its env + `fail()`.
  */
 
+import {
+  envTrustedRegistryAdmins,
+  instrumentKey,
+  KNOWN_INSTRUMENTS,
+  resolveSwapSymbol,
+} from "./registry-parties.js";
+
 export const DEFAULT_NETWORK = "canton:testnet";
 
 /** Known `--flag <value>` options; used to strip flags out of positionals. */
@@ -34,6 +41,19 @@ export const VALUE_FLAGS: ReadonlySet<string> = new Set([
   "--expires-at",
   "--days",
   "--operator-token",
+  "--id",
+  "--venue",
+  // pay: spend ceiling and payee pin.
+  "--max",
+  "--pay-to",
+  // tc: Tradecraft queued mode.
+  "--pair",
+  "--fund",
+  "--sell",
+  "--amounts",
+  "--count",
+  "--instrument",
+  "--order",
 ]);
 
 /** First value following `--<name>` in `args`, or undefined. */
@@ -204,4 +224,90 @@ export function preapprovalMode(
     mode: "self",
     ambientIgnored: Boolean(env["CANTON_X402_OPERATOR_TOKEN"]),
   };
+}
+
+/**
+ * `pay --max <amount> [--pay-to <party>]` → the signer's spend limits.
+ *
+ * `--max` caps the payment in the unit of what is paid. With `--asset` naming a
+ * registry token that is that token's own ceiling; otherwise it is the Canton
+ * Coin ceiling, and a 402 that asks for a token is then refused by the signer
+ * (a CC number cannot cap a token whose unit is worth something else) with the
+ * hint to add `--asset`. An asset we cannot resolve cannot be capped, so it is
+ * refused rather than paid uncapped. Present-but-invalid values fail fast.
+ */
+export function payLimits(
+  args: readonly string[],
+  env: NodeJS.ProcessEnv = process.env
+):
+  | {
+      kind: "ok";
+      maxPaymentValue?: string;
+      maxPaymentValueByInstrument?: Record<string, string>;
+      expectedPayTo?: string;
+    }
+  | { kind: "error"; message: string } {
+  const out: {
+    kind: "ok";
+    maxPaymentValue?: string;
+    maxPaymentValueByInstrument?: Record<string, string>;
+    expectedPayTo?: string;
+  } = { kind: "ok" };
+  if (flagPresent(args, "--pay-to")) {
+    const to = flag(args, "--pay-to")?.trim();
+    if (!to) return { kind: "error", message: "pay --pay-to was given with no party — refusing." };
+    out.expectedPayTo = to;
+  }
+  if (!flagPresent(args, "--max")) return out;
+  const raw = flag(args, "--max")?.trim() ?? "";
+  if (!/^\d+(\.\d+)?$/.test(raw) || Number(raw) <= 0) {
+    return {
+      kind: "error",
+      message: `pay --max must be a positive amount (got ${JSON.stringify(raw)}) — refusing to pay uncapped.`,
+    };
+  }
+  const asset = flag(args, "--asset");
+  if (asset === undefined) {
+    out.maxPaymentValue = raw;
+    return out;
+  }
+  const sym = resolveSwapSymbol(asset);
+  if (sym.kind === "cc") {
+    out.maxPaymentValue = raw;
+  } else if (sym.kind === "registry") {
+    // Keyed on the MainNet registrar AND every registrar trusted through
+    // CANTON_AGENT_REGISTRY_TRUSTED_PARTIES: on testnet/devnet the same symbol
+    // comes from such a registrar, and a cap keyed only on the MainNet one would
+    // never apply there. The signer looks the cap up by the instrument actually
+    // paid, so a key for a registrar that does not issue this id is inert.
+    const admins = new Set([sym.instrument.admin, ...envTrustedRegistryAdmins(env)]);
+    out.maxPaymentValueByInstrument = Object.fromEntries(
+      [...admins].map((admin) => [instrumentKey(admin, sym.instrument.id), raw])
+    );
+  } else {
+    return {
+      kind: "error",
+      message:
+        `pay --max with --asset ${asset}: that asset is not one this wallet knows, so the cap ` +
+        `cannot be applied to it — refusing to pay uncapped.`,
+    };
+  }
+  return out;
+}
+
+/**
+ * The registry instrument id `preapproval` provisions for registrar `admin`:
+ * `--id` when given, else the one instrument this wallet knows for that
+ * registrar. Undefined when it cannot be decided — the caller must then
+ * require `--id` rather than guess (it used to default to USDCx for EVERY
+ * registrar, provisioning the wrong instrument for CBTC, USDXLR, …).
+ */
+export function preapprovalInstrumentId(
+  args: readonly string[],
+  admin: string
+): string | undefined {
+  const explicit = flag(args, "--id")?.trim();
+  if (explicit) return explicit;
+  const known = Object.values(KNOWN_INSTRUMENTS).filter((i) => i.admin === admin);
+  return known.length === 1 ? known[0]!.id : undefined;
 }

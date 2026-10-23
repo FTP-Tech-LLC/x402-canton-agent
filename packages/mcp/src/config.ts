@@ -25,6 +25,14 @@ export interface SpendPolicy {
    *  claimed inbound: a compromised agent can at most re-spend what the owner
    *  funded, never more. */
   fundedCeiling: boolean;
+  /** When set, `withdraw` may send only to these parties. The hosted server
+   *  fills it with the destinations the owner confirmed with a passkey on the
+   *  account page, so an assistant steered by a prompt injection cannot send
+   *  the wallet to a stranger. An empty list refuses every withdrawal; unset
+   *  means any party (the local server). */
+  withdrawAllowlist?: readonly string[] | undefined;
+  /** Where the owner manages that list; named in the refusal. */
+  withdrawAllowlistUrl?: string | undefined;
 }
 
 export interface McpConfig {
@@ -38,11 +46,6 @@ export interface McpConfig {
    *  overrides this at create time. */
   network: string;
   apiKey?: string | undefined;
-  /** pay-proxy base URL used by `auto_fund` to bootstrap a funded wallet through
-   *  the quest (mint → grant → CanTrust payment → change). Optional: when unset,
-   *  `auto_fund` falls back to the manual-funding ask. Passed via --pay-proxy-url
-   *  or CANTON_AGENT_PAY_PROXY_URL. */
-  payProxyUrl?: string | undefined;
   policy: SpendPolicy;
 }
 
@@ -123,9 +126,6 @@ export function resolveConfig(
 
   const apiKey = flag(argv, "api-key") ?? env.CANTON_AGENT_API_KEY;
 
-  const payProxyUrl =
-    flag(argv, "pay-proxy-url") ?? env.CANTON_AGENT_PAY_PROXY_URL;
-
   const allowRaw = flag(argv, "allow-domains") ?? env.CANTON_MCP_ALLOW_DOMAINS ?? "";
   const allowDomains: string[] | "*" =
     allowRaw.trim() === "*"
@@ -162,7 +162,6 @@ export function resolveConfig(
     home,
     network,
     apiKey,
-    payProxyUrl,
     policy: {
       maxPerTx: nonNegNum(
         flag(argv, "max-per-tx") ?? env.CANTON_MCP_MAX_PER_TX,

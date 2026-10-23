@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { venueMetaForInstrument, VENUE_KEY_ENV, VENUE_TAG_ENV } from "./venue.js";
+import {
+  venueMetaForInstrument,
+  VENUE_KEY_ENV,
+  VENUE_TAG_ENV,
+  DEFAULT_VENUE_KEY,
+  DEFAULT_VENUE_TAG,
+} from "./venue.js";
 import { KNOWN_INSTRUMENTS } from "./registry-parties.js";
 
 const CBTC = KNOWN_INSTRUMENTS.CBTC!;
@@ -21,26 +27,42 @@ describe("venueMetaForInstrument", () => {
     expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({ "acme/venue": "acme" });
   });
 
-  it("stamps nothing when the KEY env is unset (only the value set)", () => {
-    const env = { [VENUE_TAG_ENV]: TAG } as NodeJS.ProcessEnv;
-    expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({});
+  it("stamps the default ftp/venue = ftp/agentic-wallet on ANY registry token with no env set", () => {
+    expect([DEFAULT_VENUE_KEY, DEFAULT_VENUE_TAG]).toEqual([KEY, TAG]);
+    for (const ins of [CBTC, USDCx, USDXLR]) {
+      expect(venueMetaForInstrument(ins.admin, ins.id, {})).toEqual({ [KEY]: TAG });
+    }
   });
 
-  it("stamps nothing when the VALUE env is unset (only the key set)", () => {
-    const env = { [VENUE_KEY_ENV]: KEY } as NodeJS.ProcessEnv;
-    expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({});
+  it("falls back to the default KEY when only the value is set", () => {
+    const env = { [VENUE_TAG_ENV]: "acme" } as NodeJS.ProcessEnv;
+    expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({ [KEY]: "acme" });
   });
 
-  it("treats blank/whitespace env as unset", () => {
+  it("falls back to the default VALUE when only the key is set", () => {
+    const env = { [VENUE_KEY_ENV]: "acme/venue" } as NodeJS.ProcessEnv;
+    expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({ "acme/venue": TAG });
+  });
+
+  it("treats blank/whitespace env as unset (the default applies)", () => {
     const env = { [VENUE_KEY_ENV]: "  ", [VENUE_TAG_ENV]: "  " } as NodeJS.ProcessEnv;
-    expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({});
+    expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({ [KEY]: TAG });
   });
 
-  it("does NOT stamp Canton Coin (undefined admin/id) even with both env set", () => {
+  it("CANTON_AGENT_VENUE_KEY=off (any case) disables stamping", () => {
+    for (const off of ["off", "OFF", " Off "]) {
+      const env = { [VENUE_KEY_ENV]: off } as NodeJS.ProcessEnv;
+      expect(venueMetaForInstrument(CBTC.admin, CBTC.id, env)).toEqual({});
+    }
+  });
+
+  it("does NOT stamp Canton Coin (undefined admin/id), by default or with env set", () => {
+    expect(venueMetaForInstrument(undefined, undefined, {})).toEqual({});
     expect(venueMetaForInstrument(undefined, undefined, on)).toEqual({});
   });
 
   it("does NOT stamp the Amulet id (Canton Coin) even if an admin is present", () => {
+    expect(venueMetaForInstrument("DSO::1220dso", "Amulet", {})).toEqual({});
     expect(venueMetaForInstrument("DSO::1220dso", "Amulet", on)).toEqual({});
   });
 

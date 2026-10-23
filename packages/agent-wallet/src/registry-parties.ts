@@ -55,20 +55,14 @@ export const KNOWN_REGISTRY_TRUSTED_PARTIES: Readonly<
       "Bridge-Operator::1220c8448890a70e65f6906bd48d797ee6551f094e9e6a53e329fd5b2b549334f13f",
     ],
   // CBTC (BitSafe), USDXLR (Excellar), cETH (onRails) — all DA Registry Utility
-  // instruments, so each carries the shared operator above. A token-specific infra
-  // party is added when its transfers reference one: CBTC declares a fee/config
-  // "cbtc-beneficiary" party in its registrar-authored InstrumentConfiguration
-  // (verified: it appears only in the authenticated InstrumentConfiguration input
-  // contract — never as a value owner or recipient — so a relay cannot forge it).
-  // cETH instead uses per-user parties minted UNDER ITS OWN NAMESPACE, which are
-  // trusted generically by the same-namespace rule in @ftptech/x402-canton-core's
-  // foreign-party backstop, so none need listing here.
+  // instruments, so each carries the shared operator above. A party that appears
+  // only in the registrar's own InstrumentConfiguration (app-reward beneficiaries,
+  // credential issuers — e.g. CBTC's cbtc-beneficiary-2) needs no listing: the
+  // core backstop admits that contract's parties in that contract alone, because
+  // the registrar changes them at will. cETH also mints per-user parties UNDER ITS
+  // OWN NAMESPACE, trusted by the same-namespace rule.
   "cbtc-network::12205af3b949a04776fc48cdcc05a060f6bda2e470632935f375d1049a8546a3b262":
-    [
-      DA_UTILITY_OPERATOR,
-      // CBTC beneficiary declared in the registrar's InstrumentConfiguration.
-      "cbtc-beneficiary::1220409a9fcc5ff6422e29ab978c22c004dde33202546b4bcbde24b25b85353366c2",
-    ],
+    [DA_UTILITY_OPERATOR],
   "excellar-issuer::12203d1e36930ee0e3fbb898add7e222a47ae9d2a5f0f6187e3a446ea32f871ce2ca":
     [DA_UTILITY_OPERATOR],
   "rails-cethMain-1::12200350ba6e96e3b701c3048b5aa013a8c1c08833e8ebf54339cff581055c29003a":
@@ -201,6 +195,15 @@ export function resolveTrustedRegistryParties(
  * set). Only then may the admin be pinned from the 402-supplied value; otherwise a
  * value-moving transfer keeps the Amulet DSO anchor / fails closed.
  */
+/**
+ * Registry admins trusted through `CANTON_AGENT_REGISTRY_TRUSTED_PARTIES`, on top
+ * of the baked-in MainNet registrars. This is how the registrar of a known
+ * symbol on another network (a testnet USDCx, say) becomes recognisable.
+ */
+export function envTrustedRegistryAdmins(env: NodeJS.ProcessEnv = process.env): string[] {
+  return Object.keys(parseEnvTrustedParties(env[REGISTRY_TRUSTED_PARTIES_ENV]));
+}
+
 export function isTrustedRegistryAdmin(
   instrumentAdmin: string,
   env: NodeJS.ProcessEnv = process.env

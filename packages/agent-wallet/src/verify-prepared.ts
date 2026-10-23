@@ -108,7 +108,7 @@ import type { TopologyTransaction } from "@canton-network/core-ledger-proto";
 
 /* Locally-used core symbols. The re-export block below is a re-export, not an
  * import, so a name needed by code IN this file has to be bound here too. */
-import { extractSelfPreapproval } from "@ftptech/x402-canton-core";
+import { assertPreparedAmuletSelfPreapproval } from "@ftptech/x402-canton-core";
 
 /* The validator moved to @ftptech/x402-canton-core (prepared-transfer.ts) so the
  * facilitator can reuse it for inline payloads. Re-exported here so every
@@ -121,6 +121,13 @@ export {
   assertPreparedTransferMatches,
   assertPreparedAcceptMatches,
   assertPreparedRegistrySelfPreapproval,
+  assertPreparedTcCreateBatcher,
+  assertPreparedTcCreateAllocation,
+  assertPreparedTcFundAllocation,
+  assertPreparedTcCreateOrders,
+  assertPreparedTcCancelOrder,
+  assertPreparedTcWithdrawalRequest,
+  KNOWN_TRADECRAFT_PACKAGE_IDS,
   PreparedDecodeError,
   PreparedTransferMismatchError,
 } from "@ftptech/x402-canton-core";
@@ -132,6 +139,13 @@ export type {
   PreparedTransferExpectation,
   PreparedAcceptExpectation,
   RegistrySelfPreapprovalExpectation,
+  TradecraftParties,
+  TcCreateBatcherExpectation,
+  TcCreateAllocationExpectation,
+  TcFundAllocationExpectation,
+  TcCreateOrdersExpectation,
+  TcCancelOrderExpectation,
+  TcWithdrawalRequestExpectation,
 } from "@ftptech/x402-canton-core";
 import {
   decodePrepared,
@@ -695,102 +709,23 @@ function assertOnboardingTopologyDecodeBindsKey(
 }
 
 
-/** The Amulet choice that creates a merchant TransferPreapproval (self-provider). */
-const SELF_PREAPPROVAL_CHOICE = "AmuletRules_CreateTransferPreapproval";
-
 /**
- * VERIFY-BEFORE-SIGN for the merchant-self-provisioned TransferPreapproval.
+ * VERIFY-BEFORE-SIGN for the merchant-self-provisioned Amulet TransferPreapproval.
  *
  * The merchant signs a RELAY-PREPARED `AmuletRules_CreateTransferPreapproval`
- * with its OWN key. A compromised/hostile relay could instead prepare a
- * fund-MOVING transaction (a transfer/withdraw of the merchant's holdings) and
- * try to get THAT signed under the merchant's key. Decode the prepared bytes and
- * fail closed unless the transaction is exactly a single-root self-preapproval:
+ * with its OWN key, and the choice spends the merchant's Amulet for the fee. A
+ * hostile relay could hand over a look-alike choice whose body moves that
+ * Amulet elsewhere, so the full check lives in core
+ * (`assertPreparedAmuletSelfPreapproval`): root template pinned, consequences
+ * and creates whitelisted from real MainNet captures, receiver/provider/expiry
+ * bound, and an all-nodes party backstop of {merchant, DSO}.
  *
- *   1. EXACTLY ONE root node, and it is an Exercise of
- *      `AmuletRules_CreateTransferPreapproval` — so no second root "leg" (e.g. an
- *      outbound transfer) rides along, and the root is not some other choice.
- *   2. `act_as` is EXACTLY [party] — the single external signer is the merchant.
- *
- * CONSEQUENCE exercises (the choice's own fee-burn on the merchant's Amulet) are
- * intentionally NOT constrained: they are children of the single authorized root
- * and are fixed by the public, audited Splice choice body — the signature
- * authorizes the ROOT choice, whose effects are not relay-controlled.
- *
- *   3. `receiver` and `provider` in the choice argument are BOTH `party`. Without
- *      this a hostile relay made the merchant pay to create a preapproval naming
- *      somebody else — the merchant burns the fee, ends up without the
- *      preapproval it believes it has, and every payment to it keeps failing
- *      while each retry burns another fee. Read positionally against a REAL
- *      MainNet capture (see `extractSelfPreapproval`), not an invented fixture.
- *   4. `expiresAt` equals `expectedExpiresAt` when the caller supplies one. The
- *      relay chooses this value (defaulting to 90 days) and echoes it in the
- *      prepare response; passing that echo back here is what binds the bytes to
- *      the terms the relay stated. Omitted → unchecked, exactly as before.
+ * `dso` must come from an out-of-band source (`resolveTrustedDsoParty`, or the
+ * operator's `--admin`) — never from the relay.
  */
 export function assertPreparedSelfPreapproval(
   preparedTransactionB64: string,
-  party: string,
-  expectedExpiresAt?: string
+  expect: { party: string; dso: string; expectedExpiresAt?: string }
 ): void {
-  const decoded = decodePrepared(preparedTransactionB64);
-
-  const rootNodes = decoded.nodes.filter((n) => decoded.roots.includes(n.nodeId));
-  if (rootNodes.length !== 1) {
-    throw new PreparedTransferMismatchError(
-      `self-preapproval verify: prepared transaction has ${rootNodes.length} root ` +
-        `nodes (want exactly 1) — refusing to sign (possible tampered/compromised relay ` +
-        `adding a second leg)`
-    );
-  }
-  const rootChoice = rootNodes[0]?.exercise?.choiceId;
-  if (rootChoice !== SELF_PREAPPROVAL_CHOICE) {
-    throw new PreparedTransferMismatchError(
-      `self-preapproval verify: the root node is not an ${SELF_PREAPPROVAL_CHOICE} ` +
-        `exercise (got ${JSON.stringify(rootChoice ?? null)}) — refusing to sign`
-    );
-  }
-  if (decoded.actAs.length !== 1 || decoded.actAs[0] !== party) {
-    throw new PreparedTransferMismatchError(
-      `self-preapproval verify: prepared act_as ${JSON.stringify(decoded.actAs)} is not ` +
-        `exactly [${party}] — refusing to sign`
-    );
-  }
-
-  const chosen = rootNodes[0]?.exercise?.chosenValue;
-  if (chosen === undefined) {
-    throw new PreparedTransferMismatchError(
-      "self-preapproval verify: the root exercise carries no choice argument — refusing to sign"
-    );
-  }
-  const arg = extractSelfPreapproval(chosen);
-  for (const [field, value] of [
-    ["receiver", arg.receiver],
-    ["provider", arg.provider],
-  ] as const) {
-    if (value !== party) {
-      throw new PreparedTransferMismatchError(
-        `self-preapproval verify: choice argument ${field} is ${JSON.stringify(value)}, ` +
-          `not ${JSON.stringify(party)} — refusing to sign (this would pay to create a ` +
-          `preapproval for somebody else)`
-      );
-    }
-  }
-  if (expectedExpiresAt !== undefined) {
-    const wantMs = Date.parse(expectedExpiresAt);
-    if (!Number.isFinite(wantMs)) {
-      throw new PreparedTransferMismatchError(
-        `self-preapproval verify: expected expiresAt ${JSON.stringify(expectedExpiresAt)} is ` +
-          `not a parseable timestamp — refusing to sign`
-      );
-    }
-    // Daml `Time` is µs since epoch; the expectation is milliseconds.
-    const wantMicros = (BigInt(wantMs) * 1000n).toString();
-    if (arg.expiresAtMicros !== wantMicros) {
-      throw new PreparedTransferMismatchError(
-        `self-preapproval verify: choice argument expiresAt is ${arg.expiresAtMicros}µs but ` +
-          `${wantMicros}µs was stated (${expectedExpiresAt}) — refusing to sign`
-      );
-    }
-  }
+  assertPreparedAmuletSelfPreapproval(preparedTransactionB64, expect);
 }

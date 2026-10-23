@@ -50,8 +50,12 @@ import type { AgentWallet } from "./store.js";
 import { resolveHashBinding } from "./hash-binding.js";
 import { resolveTrustedDsoParty } from "./trusted-dso.js";
 import { isStaleInputHoldingError } from "./tx.js";
-import { resolveTrustedRegistryParties } from "./registry-parties.js";
+import { isTrustedRegistryAdmin, resolveTrustedRegistryParties } from "./registry-parties.js";
 import { sumLedgerDecimals } from "@ftptech/x402-canton-core";
+import {
+  MAX_TRANSFER_INPUTS_AMULET,
+  MAX_TRANSFER_INPUTS_REGISTRY,
+} from "@ftptech/x402-canton-ledger";
 import type { HashBindingOptions } from "./verify-prepared.js";
 
 /** 1 atomic Amulet, as a ledger Decimal. The self-transfer moves this token
@@ -67,12 +71,20 @@ const ONE_ATOMIC = "0.0000000001";
  *  gated; small merges (≤ this) run without `--yes`, unchanged. */
 const WHALE_COST_GATE_BATCHES = 20;
 
+/** Default inputs per merge batch: the most one transaction may spend. A Canton
+ *  transaction is capped at 256 nodes; measured on MainNet an Amulet input
+ *  costs ~3 nodes (90 inputs tripped the cap) and a registry input ~1 (60
+ *  inputs = 64 nodes). Shared with the relay's input selection. */
+const AMULET_BATCH_DEFAULT = MAX_TRANSFER_INPUTS_AMULET;
+const REGISTRY_BATCH_DEFAULT = MAX_TRANSFER_INPUTS_REGISTRY;
+
 export interface MergeOptions {
   /** Stop once the LIVE holding count is at or below this (default 2 — the two
    *  amulets a single self-transfer already collapses a batch into). */
   target?: number;
-  /** Input amulets consumed per self-transfer (default 90). Bounded well under
-   *  the participant's per-tx input limit; each batch → ~2 amulets. */
+  /** Inputs consumed per self-transfer (default 70 for Canton Coin, 90 for a
+   *  registry token — see AMULET_BATCH_DEFAULT). Bounded under the 256-node
+   *  transaction cap; each batch → ~2 amulets, or one registry holding. */
   batch?: number;
   /** Max live-phase rounds after the whale pass (default 30). A hard stop so a
    *  pathological wallet can never loop unbounded. */
@@ -190,12 +202,65 @@ async function enumerateHoldingCids(
  * accounting. Every self-transfer pins receiver = wallet.party (verify-before-sign
  * enforced) — whale, chain, and live alike.
  */
+/** One registry self-transfer of `batch` for its FULL sum — the registry then
+ *  collapses the batch into a single Holding. receiver === wallet.party is the
+ *  merge invariant, pinned here and re-checked by verify-before-sign. */
+function registrySelfTransfer(
+  relay: RelayClient,
+  wallet: AgentWallet,
+  opts: MergeOptions,
+  admin: string,
+  id: string,
+  batch: ReadonlyArray<{ cid: string; amount: string }>
+): Promise<string> {
+  const doTransfer = opts.transferFn ?? transfer;
+  return doTransfer(relay, wallet, {
+    receiver: wallet.party, // SELF-transfer — the non-negotiable invariant.
+    amount: sumLedgerDecimals(batch.map((x) => x.amount)), // FULL sum → one Holding.
+    inputHoldingCids: batch.map((x) => x.cid),
+    hashBinding: opts.hashBinding ?? resolveHashBinding(),
+    registryInstrument: true,
+    expectInstrumentAdmin: admin,
+    expectInstrumentId: id,
+    trustedRegistryParties:
+      opts.trustedRegistryParties ?? resolveTrustedRegistryParties(admin, process.env),
+  });
+}
+
+/** The cost gate for a registry merge: refuse to submit without `--yes` when
+ *  the run is large (more than WHALE_COST_GATE_BATCHES planned) or of unknown
+ *  size (the wallet holds more than one read lists, so the number of batches
+ *  cannot be known up front). `maxRounds` still bounds every run. */
+function assertRegistryCostGate(
+  opts: MergeOptions,
+  plannedBatches: number,
+  complete: boolean,
+  what: string
+): void {
+  if (opts.yes || opts.dryRun) return;
+  if (complete && plannedBatches <= WHALE_COST_GATE_BATCHES) return;
+  throw new Error(
+    (complete
+      ? `merge would run ${plannedBatches} batches of ${what}, over the ${WHALE_COST_GATE_BATCHES}-batch safety gate.`
+      : `this wallet holds more ${what} holdings than the participant lists in one read, so the ` +
+        `number of batches is not known up front (up to --max-rounds ${opts.maxRounds ?? 30} per run).`) +
+      ` Each batch is a ledger transaction that consumes Global Synchronizer traffic. ` +
+      `Re-run with --yes to proceed, or --dry-run to preview.`
+  );
+}
+
 /** Registry-token branch of `merge`. Same invariant (receiver == this wallet,
  *  enforced by verify-before-sign), different mechanics: there is no Scan
  *  snapshot / whale pass for a registry token, holdings come from the HoldingV1
  *  read, and each batch is self-transferred for its FULL sum so the registry
- *  collapses it into one Holding (see MergeOptions.instrumentId). The ACS is
- *  re-read after every round, so no output chaining is needed. */
+ *  collapses it into one Holding (see MergeOptions.instrumentId).
+ *
+ *  The read is BOUNDED (`slice`): a wallet with more holdings than the
+ *  participant lists in one read gets its oldest ones. Each merged batch leaves
+ *  the slice (its single output is the newest holding) and the next read shows
+ *  the holdings behind it, so the merge still converges. What a slice cannot
+ *  show is whether this token has more holdings beyond it, so a slice that
+ *  holds too few of this token to merge is reported as such — never as done. */
 async function mergeRegistryHoldings(
   relay: RelayClient,
   wallet: AgentWallet,
@@ -204,38 +269,45 @@ async function mergeRegistryHoldings(
   id: string
 ): Promise<MergeResult> {
   const target = opts.target ?? 1; // a full-amount self-transfer leaves ONE holding
-  const batchSize = opts.batch ?? 90;
+  const batchSize = opts.batch ?? REGISTRY_BATCH_DEFAULT;
   const maxRounds = opts.maxRounds ?? 30;
-  const doTransfer = opts.transferFn ?? transfer;
   const log = opts.onProgress ?? ((): void => {});
-  const hashBinding = opts.hashBinding ?? resolveHashBinding();
-  const trustedRegistryParties =
-    opts.trustedRegistryParties ?? resolveTrustedRegistryParties(admin, process.env);
 
-  const enumerate = async (): Promise<Array<{ cid: string; amount: string }>> => {
-    const h = await relay.holdings(wallet.party, { admin, id });
+  const enumerate = async (): Promise<{
+    live: Array<{ cid: string; amount: string }>;
+    complete: boolean;
+  }> => {
+    const h = await relay.holdings(wallet.party, { admin, id }, { slice: true });
     const ins = h.instruments.find((i) => i.admin === admin && i.id === id);
-    return (ins?.holdings ?? []).filter((x) => !x.locked).map(({ cid, amount }) => ({ cid, amount }));
+    return {
+      live: (ins?.holdings ?? []).filter((x) => !x.locked).map(({ cid, amount }) => ({ cid, amount })),
+      complete: h.complete,
+    };
   };
 
-  let live = await enumerate();
+  let { live, complete } = await enumerate();
   const plannedBatches = Math.ceil(live.length / batchSize);
   if (opts.dryRun) {
     log(
-      `dry run: ${live.length} unlocked ${id} holding(s) → ${plannedBatches} batch(es) ` +
-        `of up to ${batchSize} → target ${target}. Nothing executed.`
+      complete
+        ? `dry run: ${live.length} unlocked ${id} holding(s) → ${plannedBatches} batch(es) ` +
+            `of up to ${batchSize} → target ${target}. Nothing executed.`
+        : `dry run: at least ${live.length} unlocked ${id} holding(s) among the wallet's oldest — it ` +
+            `holds more than the participant lists in one read, so the total is unknown; a real run ` +
+            `merges in batches of up to ${batchSize} until done or --max-rounds, and needs --yes. Nothing executed.`
     );
     return {
       rounds: 0,
       merged: [],
       updateIds: [],
-      finalHoldings: live.length,
+      finalHoldings: complete ? live.length : null,
       usedScan: false,
       skippedStale: 0,
       chainedRounds: 0,
       plannedBatches,
     };
   }
+  assertRegistryCostGate(opts, plannedBatches, complete || live.length <= target, id);
 
   const merged: string[] = [];
   const updateIds: string[] = [];
@@ -243,39 +315,188 @@ async function mergeRegistryHoldings(
   let skippedStale = 0;
   while (live.length > target && rounds + skippedStale < maxRounds) {
     const b = live.slice(0, batchSize);
-    const amount = sumLedgerDecimals(b.map((x) => x.amount));
     try {
-      const updateId = await doTransfer(relay, wallet, {
-        receiver: wallet.party, // SELF-transfer — the non-negotiable invariant.
-        amount, // FULL sum: the registry collapses the batch into one Holding.
-        inputHoldingCids: b.map((x) => x.cid),
-        hashBinding,
-        registryInstrument: true,
-        expectInstrumentAdmin: admin,
-        expectInstrumentId: id,
-        trustedRegistryParties,
-      });
+      const updateId = await registrySelfTransfer(relay, wallet, opts, admin, id, b);
       rounds++;
       merged.push(...b.map((x) => x.cid));
       updateIds.push(updateId);
-      log(`  round ${rounds}: merged ${b.length} ${id} holding(s) (${amount}) → updateId ${updateId}`);
+      log(`  round ${rounds}: merged ${b.length} ${id} holding(s) → updateId ${updateId}`);
     } catch (err) {
       if (!isStaleInputHoldingError(err)) throw err;
       skippedStale++;
       log(`  round ${rounds + skippedStale}: stale (already consumed) — re-enumerating`);
     }
-    live = await enumerate();
+    ({ live, complete } = await enumerate());
   }
-  if (live.length > target) log(`reached maxRounds (${maxRounds}); ${live.length} holding(s) remain.`);
-  else log(`done: ${live.length} ${id} holding(s) ≤ target ${target}.`);
+  if (live.length > target) {
+    log(`reached maxRounds (${maxRounds}); re-run to continue.`);
+  } else if (!complete) {
+    log(
+      `the wallet's oldest holdings now contain ${live.length} ${id} holding(s), but it holds more ` +
+        `than the participant lists in one read — the rest are behind other holdings. Run ` +
+        `\`canton-agent-wallet merge --all-tokens\` for other tokens' dust, and plain ` +
+        `\`canton-agent-wallet merge\` if it is Canton Coin.`
+    );
+  } else {
+    log(`done: ${live.length} ${id} holding(s) ≤ target ${target}.`);
+  }
   return {
     rounds,
     merged,
     updateIds,
-    finalHoldings: live.length,
+    finalHoldings: complete ? live.length : null,
     usedScan: false,
     skippedStale,
     chainedRounds: 0,
+  };
+}
+
+/**
+ * Consolidate EVERY registry token the wallet holds — `merge --all-tokens`.
+ *
+ * The per-token merge reads the wallet's oldest holdings and can only work on
+ * the ones of its token. On a wallet whose oldest holdings are mostly another
+ * token's dust it would stall, so this reads the same bounded slice, merges the
+ * token with the most holdings in it, and reads again — the slice keeps moving
+ * through the wallet whatever the mix. Only tokens of a TRUSTED registrar are
+ * touched (the same anchor every registry transfer verifies against); Canton
+ * Coin is left alone (`merge` without flags consolidates it).
+ *
+ * Stops when no token in the slice has more than one holding and the slice is
+ * complete, when only untrusted/locked holdings remain in view, or at
+ * `maxRounds`.
+ *
+ * The read asks for the registry tokens only (`registryOnly`), so on a current
+ * relay its `complete` is about them: Canton Coin dust neither fills the view
+ * nor makes the size "unknown". An older relay lists Canton Coin too; those
+ * rows are skipped here and counted for the advice.
+ */
+export async function mergeAllRegistryHoldings(
+  relay: RelayClient,
+  wallet: AgentWallet,
+  opts: MergeOptions = {}
+): Promise<MergeResult & { untrusted: string[] }> {
+  const target = 1;
+  const batchSize = opts.batch ?? REGISTRY_BATCH_DEFAULT;
+  const maxRounds = opts.maxRounds ?? 30;
+  const log = opts.onProgress ?? ((): void => {});
+
+  type Group = { admin: string; id: string; live: Array<{ cid: string; amount: string }> };
+  const read = async (): Promise<{
+    groups: Group[];
+    untrusted: string[];
+    cantonCoin: number;
+    complete: boolean;
+  }> => {
+    const h = await relay.holdings(wallet.party, undefined, { slice: true, registryOnly: true });
+    const groups: Group[] = [];
+    const untrusted: string[] = [];
+    let cantonCoin = 0;
+    for (const ins of h.instruments) {
+      if (!isTrustedRegistryAdmin(ins.admin, process.env)) {
+        // Canton Coin (the DSO is not a registry) is out of scope, not untrusted
+        // — but it occupies the view, so it is counted for the final advice.
+        if (ins.id === "Amulet") cantonCoin += ins.holdings.length;
+        else untrusted.push(`${ins.id}@${ins.admin}`);
+        continue;
+      }
+      const live = ins.holdings.filter((x) => !x.locked).map(({ cid, amount }) => ({ cid, amount }));
+      groups.push({ admin: ins.admin, id: ins.id, live });
+    }
+    return { groups, untrusted, cantonCoin, complete: h.complete };
+  };
+  const mergeable = (gs: Group[]): Group[] =>
+    gs.filter((g) => g.live.length > target).sort((a, b) => b.live.length - a.live.length);
+  const describe = (gs: Group[]): string =>
+    gs.map((g) => `${g.id} ${g.live.length}`).join(", ") || "none";
+
+  let view = await read();
+  const plannedBatches = mergeable(view.groups).reduce(
+    (n, g) => n + Math.ceil(g.live.length / batchSize),
+    0
+  );
+  if (view.untrusted.length > 0) {
+    log(`skipping tokens of registrars this wallet does not trust: ${view.untrusted.join(", ")}`);
+  }
+  // Why the view may be incomplete with nothing in it to merge: what fills it.
+  const fillAdvice = (v: typeof view): string => {
+    const fillers = [
+      v.cantonCoin > 2 ? `${v.cantonCoin} Canton Coin holdings — run \`canton-agent-wallet merge\` first` : "",
+      v.untrusted.length > 0 ? `tokens of untrusted registrars (${v.untrusted.join(", ")})` : "",
+    ].filter(Boolean);
+    return fillers.length > 0
+      ? `that view is filled by ${fillers.join("; ")}`
+      : `that view is filled by locked holdings, or by Canton Coin dust the relay cannot read ` +
+          `past — run plain \`canton-agent-wallet merge\` first, then this again`;
+  };
+  if (opts.dryRun) {
+    log(
+      `dry run: ${view.complete ? "" : "among the holdings in view — "}${describe(view.groups)}` +
+        ` → ${view.complete ? "" : "at least "}${plannedBatches} batch(es) of up to ${batchSize}.` +
+        (view.complete
+          ? ""
+          : plannedBatches > 0
+            ? " The wallet holds more than one read lists; a real run needs --yes."
+            : ` Nothing to merge in view, though the wallet holds more than one read lists; ${fillAdvice(view)}.`) +
+        ` Nothing executed.`
+    );
+    return {
+      rounds: 0,
+      merged: [],
+      updateIds: [],
+      finalHoldings: view.complete ? view.groups.reduce((n, g) => n + g.live.length, 0) : null,
+      usedScan: false,
+      skippedStale: 0,
+      chainedRounds: 0,
+      plannedBatches,
+      untrusted: view.untrusted,
+    };
+  }
+  // Same rule as the per-token branch: a view with nothing in it to merge runs
+  // no batch, so it needs no --yes — the advice below is the useful answer.
+  assertRegistryCostGate(opts, plannedBatches, view.complete || plannedBatches === 0, "token");
+
+  const merged: string[] = [];
+  const updateIds: string[] = [];
+  let rounds = 0;
+  let skippedStale = 0;
+  for (;;) {
+    const g = mergeable(view.groups)[0];
+    if (!g || rounds + skippedStale >= maxRounds) break;
+    const b = g.live.slice(0, batchSize);
+    try {
+      const updateId = await registrySelfTransfer(relay, wallet, opts, g.admin, g.id, b);
+      rounds++;
+      merged.push(...b.map((x) => x.cid));
+      updateIds.push(updateId);
+      log(`  round ${rounds}: merged ${b.length} ${g.id} holding(s) → updateId ${updateId}`);
+    } catch (err) {
+      if (!isStaleInputHoldingError(err)) throw err;
+      skippedStale++;
+      log(`  round ${rounds + skippedStale}: stale (already consumed) — re-reading`);
+    }
+    view = await read();
+  }
+  const left = mergeable(view.groups);
+  if (left.length > 0) {
+    log(`reached maxRounds (${maxRounds}); still to merge: ${describe(left)} — re-run to continue.`);
+  } else if (!view.complete) {
+    log(
+      `nothing left to merge among the holdings in view, but the wallet still holds more than the ` +
+        `participant lists in one read; ${fillAdvice(view)}.`
+    );
+  } else {
+    log(`done: every trusted token is down to one holding (${describe(view.groups)}).`);
+  }
+  return {
+    rounds,
+    merged,
+    updateIds,
+    finalHoldings: view.complete ? view.groups.reduce((n, gr) => n + gr.live.length, 0) : null,
+    usedScan: false,
+    skippedStale,
+    chainedRounds: 0,
+    untrusted: view.untrusted,
   };
 }
 
@@ -294,7 +515,7 @@ export async function mergeHoldings(
     return mergeRegistryHoldings(relay, wallet, opts, opts.instrumentAdmin, opts.instrumentId);
   }
   const target = opts.target ?? 2;
-  const batchSize = opts.batch ?? 90;
+  const batchSize = opts.batch ?? AMULET_BATCH_DEFAULT;
   const maxRounds = opts.maxRounds ?? 30;
   const doTransfer = opts.transferFn ?? transfer;
   const log = opts.onProgress ?? ((): void => {});

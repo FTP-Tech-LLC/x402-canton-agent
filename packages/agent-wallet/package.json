@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/canton-agent-wallet",
   "private": false,
-  "version": "1.4.0",
+  "version": "2.4.0",
   "description": "Self-custody Canton wallet + x402 autopay for AI agents. One CLI: create, pay, balance, withdraw, export, import. Backs the canton-x402-agent skill.",
   "license": "Apache-2.0",
   "author": "FTP team",
@@ -24,10 +24,10 @@
   "dependencies": {
     "@canton-network/core-tx-visualizer": "~1.4.0",
     "@canton-network/core-ledger-proto": "~1.4.0",
-    "@ftptech/x402-canton-ledger": "^0.4.0",
+    "@ftptech/x402-canton-ledger": "^0.6.2",
     "@ftptech/x402-canton-client": "workspace:^",
     "undici": "^7.1.0",
-    "@ftptech/x402-canton-core": "^1.2.0"
+    "@ftptech/x402-canton-core": "^1.4.0"
   },
   "publishConfig": {
     "access": "public"

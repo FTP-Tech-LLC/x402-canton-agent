@@ -28,7 +28,11 @@ const wallet = {
     "MC4CAQAwBQYDK2VwBCIEIJ1qOaJ0z1Vv0iSJ0uZ1uZ1uZ1uZ1uZ1uZ1uZ1uZ1uZ1\n" +
     "-----END PRIVATE KEY-----\n",
   publicKeyFingerprint: "1220bb",
+  // mainnet: the DSO the structural assert is pinned to is resolved out of band.
+  network: "canton:mainnet",
 } as never;
+const MAINNET_DSO =
+  "DSO::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc";
 
 const EXPIRES = "2026-11-10T00:00:00Z";
 
@@ -65,11 +69,11 @@ describe("selfProvisionPreapproval binds the signed hash to the validated bytes"
     // most.
     const r = relay();
     await selfProvisionPreapproval(r.obj, wallet).catch(() => undefined);
-    expect(assertPreparedSelfPreapproval).toHaveBeenCalledWith(
-      BYTES,
-      wallet.party,
-      EXPIRES
-    );
+    expect(assertPreparedSelfPreapproval).toHaveBeenCalledWith(BYTES, {
+      party: (wallet as { party: string }).party,
+      dso: MAINNET_DSO,
+      expectedExpiresAt: EXPIRES,
+    });
     expect(assertHashBinding).toHaveBeenCalledTimes(1);
     expect(assertHashBinding.mock.calls[0]![0]).toBe(BYTES);
     expect(assertHashBinding.mock.calls[0]![1]).toBe(HASH);
@@ -110,6 +114,14 @@ describe("selfProvisionPreapproval binds the signed hash to the validated bytes"
     await expect(selfProvisionPreapproval(r.obj, wallet)).rejects.toThrow(
       /hash does not match bytes/
     );
+    expect(r.commit).not.toHaveBeenCalled();
+  });
+
+  it("without an out-of-band DSO nothing is prepared or signed", async () => {
+    const r = relay();
+    const noNet = { ...(wallet as object), network: "canton:unknown" } as never;
+    await expect(selfProvisionPreapproval(r.obj, noNet)).rejects.toThrow(/no trusted DSO/);
+    expect((r.obj as { preapprovalSelfPrepare: ReturnType<typeof vi.fn> }).preapprovalSelfPrepare).not.toHaveBeenCalled();
     expect(r.commit).not.toHaveBeenCalled();
   });
 });

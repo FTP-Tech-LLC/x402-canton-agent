@@ -1,14 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import type * as AgentWallet from "@ftptech/canton-agent-wallet";
 
 /** Records the options the tool hands to the paying fetch. */
 const seen: Array<Record<string, unknown>> = [];
 
-vi.mock("@ftptech/canton-agent-wallet", () => ({
+// The real module underneath, with only the ledger-touching pieces replaced:
+// a full-replacement mock breaks every time server.ts gains an import.
+vi.mock("@ftptech/canton-agent-wallet", async (importOriginal) => ({
+  ...(await importOriginal<typeof AgentWallet>()),
   ensureWallet: async () => ({
     party: "agent::1220aaa",
     relayUrl: "https://relay.test",
@@ -28,12 +32,10 @@ vi.mock("@ftptech/canton-agent-wallet", () => ({
   saveWallet: async () => undefined,
   agentKeyFromPrivatePem: () => "k",
   withdraw: async () => ({ updateId: "u" }),
-  questFund: async () => ({ ok: true }),
-  makePayingFetch: async (opts: Record<string, unknown>) => {
+  makePayingFetchForWallet: async (_w: unknown, opts: Record<string, unknown>) => {
     seen.push(opts);
     return async () => new Response("ok", { status: 200 });
   },
-  makePayingFetchForWallet: async () => async () => new Response("ok", { status: 200 }),
 }));
 
 const { createServer } = await import("./server.js");
@@ -76,5 +78,37 @@ describe("the per-tx cap reaches the signer on the pay path", () => {
     await pay({ allowDomains: ["api.example.com"] });
     expect(seen).toHaveLength(1);
     expect(seen[0]!["maxPaymentValue"]).toBeUndefined();
+  });
+  /** Today's spend, written where the local server's file ledger keeps it. */
+  const spentToday = (cc: number) =>
+    writeFileSync(
+      join(home, "mcp-policy-ledger.json"),
+      JSON.stringify({
+        date: new Date().toISOString().slice(0, 10),
+        spentTodayCC: cc,
+        lifetimeOutCC: cc,
+        lifetimeClaimedCC: 0,
+      })
+    );
+
+  it("hands the signer the rest of today's budget when it is below the per-tx cap", async () => {
+    // 19.5 of 20 CC spent: the gate lets the call start (the cap is not yet
+    // reached), so the only thing that can stop a 5 CC charge from leaving the
+    // day at 24.5 is the ceiling the signer sees.
+    spentToday(19.5);
+    await pay({ allowDomains: ["api.example.com"], maxPerTx: 5, dailyCap: 20 });
+    expect(seen[0]!["maxPaymentValue"]).toBe("0.5");
+  });
+
+  it("keeps the per-tx cap, verbatim, while it is the smaller number", async () => {
+    spentToday(1);
+    await pay({ allowDomains: ["api.example.com"], maxPerTx: 5, dailyCap: 20 });
+    expect(seen[0]!["maxPaymentValue"]).toBe("5");
+  });
+
+  it("makes a daily cap alone a ceiling too", async () => {
+    spentToday(1.25);
+    await pay({ allowDomains: ["api.example.com"], dailyCap: 3 });
+    expect(seen[0]!["maxPaymentValue"]).toBe("1.75");
   });
 });

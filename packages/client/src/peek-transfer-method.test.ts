@@ -2,9 +2,14 @@ import { describe, it, expect, vi } from "vitest";
 import {
   HEADER_PAYMENT_REQUIRED_V2,
   HEADER_PAYMENT_SIGNATURE_V2,
+  atomicToDecimalCC,
   encodeBase64Json,
 } from "@ftptech/x402-canton-core";
-import { peekChosenTransferMethod, wrapFetchWithCantonPayment } from "./fetch.js";
+import {
+  peekChosenRequirement,
+  peekChosenTransferMethod,
+  wrapFetchWithCantonPayment,
+} from "./fetch.js";
 import type { CantonSigner } from "./signer.js";
 
 const MERCHANT = "merchant::1220m";
@@ -130,5 +135,82 @@ describe("peekChosenTransferMethod", () => {
     expect(res.status).toBe(200);
     expect(peeked).toBe("transfer-factory");
     expect(signer.signTransferFactory).toHaveBeenCalledTimes(1);
+  });
+});
+
+/** A two-entry challenge: Canton Coin first, a registry token second — the
+ *  shape a multi-asset merchant (CanTrust) actually sends. */
+function twoAssetResp(): Response {
+  const entry = (asset: string, amount: string, id: string) => ({
+    scheme: "exact",
+    network: "canton:devnet",
+    amount,
+    asset,
+    payTo: MERCHANT,
+    maxTimeoutSeconds: 60,
+    extra: {
+      assetTransferMethod: "transfer-factory",
+      feePayer: FAC,
+      synchronizerId: SYNC,
+      instrumentId: { admin: FAC, id },
+      executeBeforeSeconds: 60,
+    },
+  });
+  return new Response("payment required", {
+    status: 402,
+    headers: {
+      [HEADER_PAYMENT_REQUIRED_V2]: encodeBase64Json({
+        x402Version: 2,
+        resource: { url: "https://api.example.com/x" },
+        accepts: [entry("CC", "3307888041", "Amulet"), entry("USDCx", "351000000", "USDCx")],
+      }),
+    },
+  });
+}
+
+describe("peekChosenRequirement", () => {
+  it("returns the entry that would be paid: payee, atomic amount, instrument", () => {
+    const r = peekChosenRequirement(twoAssetResp(), allSigner());
+    expect(r?.payTo).toBe(MERCHANT);
+    expect(r?.amount).toBe("3307888041");
+    expect(r?.extra.instrumentId?.id).toBe("Amulet");
+  });
+
+  it("honors selectRequirements, as the paying fetch does", () => {
+    const r = peekChosenRequirement(twoAssetResp(), allSigner(), {
+      selectRequirements: (c) => c.find((a) => a.asset === "USDCx") ?? c[0]!,
+    });
+    expect(r?.extra.instrumentId?.id).toBe("USDCx");
+    expect(r?.amount).toBe("351000000");
+  });
+
+  it("is undefined wherever peekChosenTransferMethod is (non-402, no header, no compatible entry)", () => {
+    expect(peekChosenRequirement(new Response("ok", { status: 200 }), allSigner())).toBeUndefined();
+    expect(peekChosenRequirement(new Response("x", { status: 402 }), allSigner())).toBeUndefined();
+    expect(peekChosenRequirement(twoAssetResp(), noMethodSigner())).toBeUndefined();
+  });
+
+  // DRIFT GUARD: a caller that funds a wallet on the strength of the peeked
+  // amount must see the amount and payee the signer is then asked to sign.
+  it("agrees with the receiver and amount wrapFetchWithCantonPayment hands the signer", async () => {
+    const signer = allSigner();
+    const fetchImpl = vi.fn(async (_url: string, init?: { headers?: HeadersInit }) => {
+      const h = new Headers(init?.headers);
+      if (h.has(HEADER_PAYMENT_SIGNATURE_V2)) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return twoAssetResp();
+    }) as unknown as typeof globalThis.fetch;
+
+    const peeked = peekChosenRequirement(twoAssetResp(), signer);
+    const res = await wrapFetchWithCantonPayment(fetchImpl, signer)("https://api.example.com/x");
+
+    expect(res.status).toBe(200);
+    const signed = (signer.signTransferFactory as ReturnType<typeof vi.fn>).mock.calls[0]![0] as {
+      receiver: string;
+      amount: string;
+    };
+    expect(signed.receiver).toBe(peeked?.payTo);
+    expect(signed.amount).toBe(atomicToDecimalCC(peeked!.amount));
   });
 });

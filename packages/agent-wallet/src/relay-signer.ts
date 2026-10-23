@@ -195,6 +195,25 @@ export function makeRelaySigner(
           `Set maxPaymentValueByInstrument for it, or clear maxPaymentValue.`
       );
     }
+    // The mirror case. A caller that capped only some TOKENS has said nothing
+    // about the instrument being paid, and silence must not read as
+    // "uncapped": a 402 that advertises a capped token's symbol but carries a
+    // Canton Coin instrumentId, or that offers another payable token first,
+    // would otherwise be signed for any amount the merchant names.
+    if (
+      capRaw === undefined &&
+      opts.maxPaymentValueByInstrument !== undefined &&
+      Object.keys(opts.maxPaymentValueByInstrument).length > 0
+    ) {
+      throw new Error(
+        `refusing to sign: a spend cap is configured only for ` +
+          `${Object.keys(opts.maxPaymentValueByInstrument).join(", ")} and this payment is ` +
+          (registryInstrument === undefined
+            ? `in Canton Coin. Set maxPaymentValue for Canton Coin, or pay in the capped instrument.`
+            : `in ${instrumentKey(registryInstrument.admin, registryInstrument.id)}. ` +
+              `Set maxPaymentValueByInstrument for it, or pay in a capped instrument.`)
+      );
+    }
     if (capRaw !== undefined) {
       const want = Number(amount);
       const cap = Number(capRaw);
@@ -249,7 +268,7 @@ export function makeRelaySigner(
       // Venue attribution: for a registry-token payment, stamp the wallet's
       // configured `/venue` tag into the transfer meta (relay-side, alongside
       // x402.memo) so an issuer's incentive program can attribute this payment.
-      // Empty unless CANTON_AGENT_VENUE_KEY + _TAG are set; never for Amulet.
+      // On by default (ftp/venue); CANTON_AGENT_VENUE_KEY=off disables; never for Amulet.
       const venueMeta = _isRegistry
         ? venueMetaForInstrument(_admin, input.instrumentId.id, process.env)
         : {};

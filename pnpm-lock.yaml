@@ -36,11 +36,11 @@ importers:
         specifier: workspace:^
         version: link:../client
       '@ftptech/x402-canton-core':
-        specifier: ^1.2.0
-        version: 1.2.0
+        specifier: ^1.4.0
+        version: 1.4.0
       '@ftptech/x402-canton-ledger':
-        specifier: ^0.4.0
-        version: 0.4.0
+        specifier: ^0.6.2
+        version: 0.6.2
       undici:
         specifier: ^7.1.0
         version: 7.28.0
@@ -48,11 +48,11 @@ importers:
   packages/client:
     dependencies:
       '@ftptech/x402-canton-core':
-        specifier: ^1.2.0
-        version: 1.2.0
+        specifier: ^1.4.0
+        version: 1.4.0
       '@ftptech/x402-canton-ledger':
-        specifier: ^0.4.0
-        version: 0.4.0
+        specifier: ^0.6.2
+        version: 0.6.2
 
   packages/mcp:
     dependencies:
@@ -250,11 +250,11 @@ packages:
     resolution: {integrity: sha512-43/qtrDUokr7LJqoF2c3+RInu/t4zfrpYdoSDfYyhg52rwLV6TnOvdG4fXm7IkSB3wErkcmJS9iEhjVtOSEjjA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
 
-  '@ftptech/x402-canton-core@1.2.0':
-    resolution: {integrity: sha512-bx1YbNR13OEGGkzVcioQsGif41BhZwzoZ8TUyI5FNzOhIfoO/6VFdM49yHTfZQV7fTBbOLsAGGQQwfI2/qbq9w==}
+  '@ftptech/x402-canton-core@1.4.0':
+    resolution: {integrity: sha512-gRad3we8Gfx0WYGM5IJgcC9WfJ9yoNBgCFcpfvQDosUyIUty8wc7JeMIaTHV6h9wI9tfOGqUQ5HEREix/xgQ0Q==}
 
-  '@ftptech/x402-canton-ledger@0.4.0':
-    resolution: {integrity: sha512-H3pc+oBvwogjzpkKuuqYspJGjmdHioSsmXY33tkegloMmsLa2RzYZNoFPQIJgf5I+GGYWj7rPOP5jC/y13ta5w==}
+  '@ftptech/x402-canton-ledger@0.6.2':
+    resolution: {integrity: sha512-8ddey+DlMxwdxQ9oCiu+MBKsies1Efr/qmbxVUnQvNjFo/tuMpOfew6sxhGpEN9UjkewKgb1jnRxp1K1SxQqIg==}
 
   '@hono/node-server@1.19.14':
     resolution: {integrity: sha512-GwtvgtXxnWsucXvbQXkRgqksiH2Qed37H9xHZocE5sA3N8O8O8/8FA3uclQXxXVzc9XBZuEOMK7+r02FmSpHtw==}
@@ -1504,9 +1504,9 @@ snapshots:
       '@eslint/core': 0.17.0
       levn: 0.4.1
 
-  '@ftptech/x402-canton-core@1.2.0': {}
+  '@ftptech/x402-canton-core@1.4.0': {}
 
-  '@ftptech/x402-canton-ledger@0.4.0':
+  '@ftptech/x402-canton-ledger@0.6.2':
     dependencies:
       '@canton-network/core-tx-visualizer': 1.4.0
 
