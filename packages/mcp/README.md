@@ -1,95 +1,57 @@
 # @ftptech/canton-x402-mcp
 
-A self-custody **Canton x402 agent wallet, exposed as an MCP server**. The owner
-connects it **out-of-band** (`claude mcp add ...`); the agent then *calls tools*.
-It never runs an install and never sees the private key. This is the delivery
-model that the old "skill tells the agent to `npm i` a money CLI" approach could
-not use: agent-safety classifiers hard-deny in-session untrusted-install +
-money movement, and chat consent cannot clear a hard-deny. Connecting an MCP
-server is the human's out-of-band trust grant.
+A self-custody Canton x402 wallet as a local MCP server. The owner connects it once; the agent then calls tools and never sees the key. Built on [`@ftptech/canton-agent-wallet`](../agent-wallet).
 
-Thin wrapper over [`@ftptech/canton-agent-wallet`](../agent-wallet): all crypto,
-relay, and verify-before-sign live there and are reused verbatim. Relay-only:
-the server talks only to the facilitator over HTTPS (+ a read-only Lighthouse
-GET for verification). No node/validator.
+Prefer not to run anything? The hosted server at `https://pay.ftptech.xyz/mcp` has the same tools as a custom connector in Claude, ChatGPT (developer mode) or Perplexity. It is custodial: you sign in with a passkey and manage limits on `https://pay.ftptech.xyz/account`.
 
-## Connect it (the owner does this once)
+## Connect
 
 ```bash
 claude mcp add canton-x402 -- npx -y @ftptech/canton-x402-mcp \
   --relay-url https://facilitator.ftptech.xyz \
-  --pay-proxy-url https://pay.ftptech.xyz \
   --home ~/.canton-x402-mcp/myagent \
   --allow-domains api.example.com \
-  --daily-cap 2 --max-per-tx 1
+  --max-per-tx 1 --daily-cap 2
 ```
 
-Everything after `--` is the launch command the MCP client spawns. The flags are
-the **spend policy**: the owner's trust boundary that makes auto-approving small
-payments defensible.
+The relay settles on Canton MainNet, so payments spend real CC.
+
+## Spend policy
+
+Set by the owner at launch; the agent cannot change it. Checked before anything is signed.
+
+| Flag | Env | Does |
+| --- | --- | --- |
+| `--relay-url` | | Required |
+| `--allow-domains <hosts\|*>` | `CANTON_MCP_ALLOW_DOMAINS` | Hosts `pay` may reach. Empty denies all |
+| `--max-per-tx <CC>` | `CANTON_MCP_MAX_PER_TX` | Cap per payment |
+| `--daily-cap <CC>` | `CANTON_MCP_DAILY_CAP` | Outbound CC per UTC day |
+| `--no-funded-ceiling` | `CANTON_MCP_FUNDED_CEILING=false` | Allow spending more than was received |
+| `--home <dir>` | | Wallet directory |
 
 ## Tools
 
-| Tool | Moves money? | Recommended permission |
-|------|--------------|------------------------|
-| `get_address` | no (read) | auto-allow |
-| `get_balance` | no (read) | auto-allow |
-| `request_funding` | no (read; returns party id + a paste-ready owner message) | auto-allow |
-| `auto_fund` | inbound only (bootstraps a FUNDED wallet via the pay-proxy quest; see below) | auto-allow ok |
-| `claim` | inbound only (accepts incoming transfers) | auto-allow ok |
-| `pay({url})` | **funds OUT** | **ask / cap** |
-| `withdraw({to,amount?})` | **funds OUT** | **ask** |
+| Tool | Moves money |
+| --- | --- |
+| `get_address`, `get_balance`, `request_funding` | no |
+| `claim` | inbound only |
+| `pay({ url, method?, headers?, body? })` | yes |
+| `withdraw({ to, amount? })` | yes |
+| `swap({ in, out, amount, venue?, slippage?, direct?, wait? })` | yes, to a pinned venue |
 
-`export`/`import` are **deliberately not tools**; they would hand the agent the
-private key. Back up/restore the key out-of-band with the `canton-agent-wallet`
-CLI against the same `--home`.
+Let the agent call the read tools freely; ask or cap the rest.
 
-## Funding (`auto_fund`): the quest, not a bare faucet
+## Funding
 
-The facilitator's raw faucet is locked (internal callers only), so `auto_fund`
-bootstraps through the pay-proxy QUEST: the pay-proxy mints a wallet, grants it
-CC, immediately spends the bulk on a CanTrust image call, and hands back the
-wallet KEY plus the small change (and the image URL). The MCP imports that key
-into `--home`, so the agent self-custodies the funded wallet afterwards.
+A new wallet gets a 0.2 CC starter grant, accepted in the background. For more, `request_funding` returns the party id and a message for the owner; after the owner sends CC, `claim` accepts it.
 
-- Requires `--pay-proxy-url` (or `CANTON_AGENT_PAY_PROXY_URL`). Without it,
-  `auto_fund` falls back to the manual-funding ask (same as `request_funding`).
-- NO-CLOBBER: a wallet that already holds a balance is never replaced —
-  `auto_fund` just reports it. Only an absent or empty wallet is bootstrapped
-  (note: bootstrapping an EMPTY wallet imports a fresh server-minted party).
-- Any quest failure (paused, over budget, upstream down) degrades to the
-  manual-funding message — never a hard tool error.
+## Good to know
 
-## Spend policy (set by the owner at startup; the agent cannot change it)
-
-- `--max-per-tx <CC>` / `CANTON_MCP_MAX_PER_TX`: per-transaction cap.
-- `--daily-cap <CC>` / `CANTON_MCP_DAILY_CAP`: rolling 24h outbound (pay+withdraw).
-- `--allow-domains <csv|*>` / `CANTON_MCP_ALLOW_DOMAINS`: hostnames `pay` may target. **Empty = deny-all (fail-closed).** `*` = any.
-- `--no-funded-ceiling` / `CANTON_MCP_FUNDED_CEILING=false`: disable the default "outbound never exceeds claimed inbound" guard.
-
-Enforced **before** anything is signed; a refusal sends nothing to the relay.
-Totals persist in `<home>/mcp-policy-ledger.json` (0600).
-
-`pay` is covered too, and pre-sign. The CC price is only known mid-x402-dance,
-so the cap is handed to the paying fetch as `maxPaymentValue` and enforced by
-the relay signer BEFORE it signs anything: a quote above the cap is refused with
-nothing sent to the relay. The daily cap, funded ceiling, domain allowlist and
-balance-delta accounting all still apply on top.
-
-This sentence used to describe `pay` as bounded by everything EXCEPT a pre-sign
-per-tx block, which stopped being true when the cap was wired through. A README
-that understates a money guard is not a harmless doc lag: someone reading it
-either builds a second guard they do not need, or widens their daily cap to
-compensate for protection they already had.
-
-## Notes
-
-- First payment takes ~60 to 90s (Canton creates the payment counter lazily;
-  `counter_not_ready` is normal internal retry). `pay` calls the URL **exactly
-  once**; never wrap it in a retry loop (double-pay risk). On a timeout, check
-  `get_balance` before retrying.
-- Verification: `get_balance` is the on-ledger truth; `pay`/`withdraw` also
-  cross-check Lighthouse (`verdict==accepted` AND `send==TransferCommandResultSuccess`).
-- `--relay-url` is required (no default). `network` is auto-resolved from the
-  relay's `/supported`; the `--network` fallback is only used if the relay can't
-  be reached at create time.
+- **Back up the key with the CLI**, pointed at the same home. `export` is not a tool on purpose:
+  ```bash
+  CANTON_AGENT_HOME=~/.canton-x402-mcp/myagent npx @ftptech/canton-agent-wallet export
+  ```
+- **Never retry `pay` in a loop.** After a timeout or error, check `get_balance` first: the payment may have gone through.
+- **CC only by default.** The caps are in CC, so a 402 that asks only for a token is refused. Spending a token also needs `CANTON_AGENT_PAYABLE_INSTRUMENTS`.
+- **Call `swap` once.** On a timeout, run `get_balance` and `claim` first: the input may already be sent.
+- `get_balance` is the truth for whether a payment went through.

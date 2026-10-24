@@ -419,28 +419,25 @@ export function readPaymentResponseHeader<T = unknown>(
 }
 
 /**
- * Peek which on-ledger transfer method `wrapFetchWithCantonPayment` WOULD choose
- * for a given 402 response + signer, WITHOUT paying. Mirrors the exact selection
+ * Peek which accepts[] entry `wrapFetchWithCantonPayment` WOULD pay for a given
+ * 402 response + signer, WITHOUT paying. Mirrors the exact selection
  * `fetchWithPayment` runs (decode the PAYMENT-REQUIRED header → keep exact
  * entries the optional networkFilter allows → narrow to the methods THIS signer
  * can produce → `selectRequirements ?? compatible[0]`). Returns the chosen
- * `extra.assetTransferMethod`, or `undefined` when it cannot tell (non-402,
- * missing or malformed header, no compatible entry).
+ * entry, or `undefined` when it cannot tell (non-402, missing or malformed
+ * header, no compatible entry).
  *
- * The agent-wallet pay layer uses this to decide whether a pay needs the
- * per-wallet serialization mutex: the only method is transfer-factory, which is
- * no-nonce and runs concurrently, so a recognized method needs NO mutex.
- * `undefined` ("can't tell") is treated as "serialize" (fail safe) by the caller,
- * so an unparseable 402 never runs unserialized by accident.
- *
- * Kept in THIS module beside `fetchWithPayment` so the two selections cannot
- * drift; a test pins that peek agrees with the method actually paid.
+ * A caller that must decide something BEFORE paying — whether to serialize the
+ * pay, whether the quoted amount fits a budget it is about to fund — reads the
+ * entry that will actually be paid, not a re-derivation of it. Kept in THIS
+ * module beside `fetchWithPayment` so the two selections cannot drift; a test
+ * pins that peek agrees with what is actually paid.
  */
-export function peekChosenTransferMethod(
+export function peekChosenRequirement(
   response: Response,
   signer: CantonSigner,
   options: WrapFetchOptions = {}
-): string | undefined {
+): PaymentRequirements | undefined {
   if (response.status !== 402) return undefined;
   const header = response.headers.get(HEADER_PAYMENT_REQUIRED_V2);
   if (!header) return undefined;
@@ -459,7 +456,24 @@ export function peekChosenTransferMethod(
   const methods = signerMethods(signer);
   const compatible = candidates.filter((a) => methods.has(a.extra.assetTransferMethod ?? ""));
   if (compatible.length === 0) return undefined;
-  const chosen =
-    options.selectRequirements?.(compatible) ?? (compatible[0] as PaymentRequirements);
-  return chosen ? chosen.extra.assetTransferMethod : undefined;
+  return options.selectRequirements?.(compatible) ?? compatible[0];
+}
+
+/**
+ * The on-ledger transfer method `wrapFetchWithCantonPayment` WOULD use for a
+ * 402, or `undefined` when it cannot tell — `peekChosenRequirement` narrowed to
+ * `extra.assetTransferMethod`.
+ *
+ * The agent-wallet pay layer uses this to decide whether a pay needs the
+ * per-wallet serialization mutex: the only method is transfer-factory, which is
+ * no-nonce and runs concurrently, so a recognized method needs NO mutex.
+ * `undefined` ("can't tell") is treated as "serialize" (fail safe) by the caller,
+ * so an unparseable 402 never runs unserialized by accident.
+ */
+export function peekChosenTransferMethod(
+  response: Response,
+  signer: CantonSigner,
+  options: WrapFetchOptions = {}
+): string | undefined {
+  return peekChosenRequirement(response, signer, options)?.extra.assetTransferMethod;
 }

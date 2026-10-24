@@ -12,9 +12,11 @@
  * (USDXLR/cETH/…) work with no code change, and any operator of this (public)
  * wallet can set their OWN key + value.
  *
- * OFF BY DEFAULT: both the key (`CANTON_AGENT_VENUE_KEY`) and the value
- * (`CANTON_AGENT_VENUE_TAG`) come from env; with either unset nothing is stamped,
- * so a public wallet user never emits someone else's venue tag. The tag rides in
+ * ON BY DEFAULT: with no env set, every outbound registry-token transfer carries
+ * `ftp/venue = ftp/agentic-wallet` — this package IS the FTP Agentic Wallet, so
+ * the tag names the wallet the payment went through. `CANTON_AGENT_VENUE_KEY` /
+ * `CANTON_AGENT_VENUE_TAG` override the key / value (an operator attributing to
+ * their own venue), and `CANTON_AGENT_VENUE_KEY=off` disables stamping. The tag rides in
  * `transfer.meta.values` (a standard CIP-56 field) — advisory, not money-critical,
  * and not pinned by verify-before-sign; a stray value can only misattribute a
  * reward, never move funds. Canton Coin (Amulet) is never stamped: it is not a
@@ -24,12 +26,17 @@
 /** Env holding the metadata KEY. MUST end in `/venue` and be at most 64 chars
  *  (e.g. `ftp/venue`) — the facilitator's pay/prepare enforces exactly this, so a
  *  key that doesn't conform is refused here too rather than stamped on one path
- *  (withdraw) and 400-rejected on another (pay). Unset/empty → attribution off. */
+ *  (withdraw) and 400-rejected on another (pay). Unset/empty → {@link DEFAULT_VENUE_KEY};
+ *  `off` (any case) → attribution off. */
 export const VENUE_KEY_ENV = "CANTON_AGENT_VENUE_KEY";
 
-/** Env holding the venue VALUE string, at most 128 chars (e.g.
- *  `ftp/agentic-wallet`). Unset/empty → attribution off. */
+/** Env holding the venue VALUE string, at most 128 chars. Unset/empty →
+ *  {@link DEFAULT_VENUE_TAG}. */
 export const VENUE_TAG_ENV = "CANTON_AGENT_VENUE_TAG";
+
+/** Default key + value: attribute to the FTP Agentic Wallet. */
+export const DEFAULT_VENUE_KEY = "ftp/venue";
+export const DEFAULT_VENUE_TAG = "ftp/agentic-wallet";
 
 /** The key suffix + size bounds the facilitator's pay/prepare enforces. ONE rule,
  *  enforced at the source: a non-conforming env config stamps NOTHING anywhere,
@@ -44,11 +51,11 @@ let warnedInvalid = false;
 
 /**
  * The venue meta to merge onto an outbound transfer of `(admin, id)`. Returns
- * `{ [key]: tag }` only when BOTH env vars are set, the key ends in `/venue`
- * within the size bounds above, AND the instrument is a CIP-56 registry token —
- * i.e. `admin` and `id` are defined and `id` is not `"Amulet"`. Otherwise `{}`:
- * Canton Coin (no registry admin, or the Amulet id), either env unconfigured, or
- * a non-conforming key/tag (warned once on stderr) all yield no stamp. Any
+ * `{ [key]: tag }` — the env values, else the defaults — when the key ends in
+ * `/venue` within the size bounds above AND the instrument is a CIP-56 registry
+ * token, i.e. `admin` and `id` are defined and `id` is not `"Amulet"`. Otherwise
+ * `{}`: Canton Coin (no registry admin, or the Amulet id), `CANTON_AGENT_VENUE_KEY=off`,
+ * or a non-conforming key/tag (warned once on stderr) all yield no stamp. Any
  * registry token is attributed — there is no per-token allowlist.
  */
 export function venueMetaForInstrument(
@@ -56,9 +63,9 @@ export function venueMetaForInstrument(
   id: string | undefined,
   env: NodeJS.ProcessEnv = process.env
 ): Record<string, string> {
-  const key = env[VENUE_KEY_ENV]?.trim();
-  const tag = env[VENUE_TAG_ENV]?.trim();
-  if (!key || !tag) return {};
+  const key = env[VENUE_KEY_ENV]?.trim() || DEFAULT_VENUE_KEY;
+  const tag = env[VENUE_TAG_ENV]?.trim() || DEFAULT_VENUE_TAG;
+  if (key.toLowerCase() === "off") return {};
   if (
     !key.endsWith(VENUE_KEY_SUFFIX) ||
     key.length > VENUE_KEY_MAX ||

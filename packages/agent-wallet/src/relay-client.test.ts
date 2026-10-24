@@ -3,6 +3,9 @@ import {
   RelayClient,
   RelayHttpError,
   isHoldingsExceedNodeLimitError,
+  PAY_AND_CLAIM_RELAY_ROUTES,
+  RelayTimeoutError,
+  DEFAULT_RELAY_TIMEOUT_MS,
 } from "./relay-client.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -90,62 +93,6 @@ describe("RelayClient", () => {
     const r = await new RelayClient({ relayUrl: "http://relay" }).balance("agent::1");
     expect(r.cc).toBe("10.0000000000");
     expect(r.holdings[0]!.cid).toBe("h");
-  });
-
-  it("faucetClaim POSTs {party} to /v1/wallet/faucet/claim and returns the parsed body", async () => {
-    const cap = captureFetch(() =>
-      new Response(
-        JSON.stringify({ updateId: "u-fc", amount: "0.02", party: "agent::1220abcd" }),
-        { status: 200 }
-      )
-    );
-    const r = await new RelayClient({ relayUrl: "http://relay" }).faucetClaim("agent::1220abcd");
-    expect(cap.calls[0]!.url).toBe("http://relay/v1/wallet/faucet/claim");
-    expect(cap.calls[0]!.init.method).toBe("POST");
-    expect(JSON.parse(cap.calls[0]!.init.body as string)).toEqual({ party: "agent::1220abcd" });
-    expect(r).toEqual({ updateId: "u-fc", amount: "0.02", party: "agent::1220abcd" });
-  });
-
-  it("faucetClaim sends X-Faucet-Secret only when a faucetSecret is configured", async () => {
-    // With the secret configured → header present.
-    const withSecret = captureFetch(() =>
-      new Response(
-        JSON.stringify({ updateId: "u", amount: "0.02", party: "agent::1220abcd" }),
-        { status: 200 }
-      )
-    );
-    await new RelayClient({
-      relayUrl: "http://relay",
-      faucetSecret: "shhh",
-    }).faucetClaim("agent::1220abcd");
-    expect(
-      (withSecret.calls[0]!.init.headers as Record<string, string>)[
-        "x-faucet-secret"
-      ]
-    ).toBe("shhh");
-
-    // Without it → no header (works against an un-locked facilitator).
-    const noSecret = captureFetch(() =>
-      new Response(
-        JSON.stringify({ updateId: "u", amount: "0.02", party: "agent::1220abcd" }),
-        { status: 200 }
-      )
-    );
-    await new RelayClient({ relayUrl: "http://relay" }).faucetClaim(
-      "agent::1220abcd"
-    );
-    expect(
-      (noSecret.calls[0]!.init.headers as Record<string, string>)[
-        "x-faucet-secret"
-      ]
-    ).toBeUndefined();
-  });
-
-  it("faucetClaim surfaces a relay 503 (faucet disabled / over budget) as a descriptive Error", async () => {
-    captureFetch(() => new Response(JSON.stringify({ error: "faucet disabled" }), { status: 503 }));
-    await expect(
-      new RelayClient({ relayUrl: "http://relay" }).faucetClaim("agent::1")
-    ).rejects.toThrow(/relay POST .*faucet\/claim -> 503/);
   });
 
   it("txAmulets GETs the tx-amulets route by updateId (URL-encoded party) and returns the typed result", async () => {
@@ -325,5 +272,148 @@ describe("RelayClient preapproval (transfer-factory V3 merchant setup)", () => {
       operatorToken: "t",
     });
     expect(JSON.parse(cap.calls[0]!.init.body as string)).toEqual({});
+  });
+});
+
+/**
+ * A pay-proxy image bundling an old wallet called POST /v1/wallet/pay/commit for
+ * weeks after the facilitator dropped it, and every quest funded a wallet first
+ * and failed second. `missingRoutes` is how a caller asks before it funds.
+ */
+describe("RelayClient.missingRoutes", () => {
+  const notFound = (path: string) =>
+    new Response(
+      JSON.stringify({ message: `Route POST:${path} not found`, error: "Not Found", statusCode: 404 }),
+      { status: 404 }
+    );
+
+  it("names only the routes the relay answers with Fastify's route-not-found 404", async () => {
+    const cap = captureFetch((url) => {
+      if (url.endsWith("/v1/wallet/pay/commit")) return notFound("/v1/wallet/pay/commit");
+      // A served route rejects the empty body before doing any work.
+      return new Response(JSON.stringify({ error: "party, receiver, amount required" }), { status: 400 });
+    });
+    const missing = await new RelayClient({ relayUrl: "http://relay/" }).missingRoutes([
+      "/v1/wallet/pay/prepare",
+      "/v1/wallet/pay/commit",
+    ]);
+    expect(missing).toEqual(["/v1/wallet/pay/commit"]);
+    // An empty JSON body, POSTed — nothing a served route could act on.
+    expect(cap.calls.map((c) => [c.init.method, c.init.body])).toEqual([
+      ["POST", "{}"],
+      ["POST", "{}"],
+    ]);
+  });
+
+  it("a 404 that is NOT the route-not-found answer means the route exists", async () => {
+    captureFetch(() => new Response(JSON.stringify({ error: "instruction not found" }), { status: 404 }));
+    expect(
+      await new RelayClient({ relayUrl: "http://relay" }).missingRoutes(["/v1/wallet/resolve/accept"])
+    ).toEqual([]);
+  });
+
+  it("a relay it cannot reach is an error, never 'nothing missing'", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      })
+    );
+    await expect(
+      new RelayClient({ relayUrl: "http://relay" }).missingRoutes(["/v1/wallet/pay/prepare"])
+    ).rejects.toThrow(/fetch failed/);
+  });
+
+  it("the pay and claim calls use exactly the exported route strings", async () => {
+    const cap = captureFetch(() => new Response(JSON.stringify({}), { status: 200 }));
+    const c = new RelayClient({ relayUrl: "http://relay" });
+    await c.payPrepare({} as never);
+    await c.resolveAccept({} as never);
+    await c.submitPrepare({});
+    await c.submitExecute({});
+    expect(cap.calls.map((x) => new URL(x.url).pathname)).toEqual([
+      PAY_AND_CLAIM_RELAY_ROUTES.payPrepare,
+      PAY_AND_CLAIM_RELAY_ROUTES.resolveAccept,
+      PAY_AND_CLAIM_RELAY_ROUTES.submitPrepare,
+      PAY_AND_CLAIM_RELAY_ROUTES.submitExecute,
+    ]);
+  });
+});
+
+describe("RelayClient — bounded holdings reads", () => {
+  it("holdings(…, {slice:true}) sends slice=1 and reports `complete` from the relay", async () => {
+    const cap = captureFetch(() => new Response(JSON.stringify({ party: "p", instruments: [], complete: false }), { status: 200 }));
+    const h = await new RelayClient({ relayUrl: "http://relay" }).holdings("agent::1", { admin: "a::1", id: "USDCx" }, { slice: true });
+    const u = new URL(cap.calls[0]!.url);
+    expect(u.searchParams.get("slice")).toBe("1");
+    expect(u.searchParams.get("admin")).toBe("a::1");
+    expect(u.searchParams.get("id")).toBe("USDCx");
+    expect(h.complete).toBe(false);
+  });
+
+  it("holdings(…, {registryOnly}) asks for the registry tokens only (class=registry); an instrument read never sends it", async () => {
+    const cap = captureFetch(() => new Response(JSON.stringify({ party: "p", instruments: [], complete: true }), { status: 200 }));
+    const c = new RelayClient({ relayUrl: "http://relay" });
+    await c.holdings("agent::1", undefined, { slice: true, registryOnly: true });
+    const u = new URL(cap.calls[0]!.url);
+    expect(u.searchParams.get("class")).toBe("registry");
+    expect(u.searchParams.get("slice")).toBe("1");
+    await c.holdings("agent::1", { admin: "a::1", id: "USDCx" }, { slice: true, registryOnly: true });
+    expect(new URL(cap.calls[1]!.url).searchParams.has("class")).toBe(false);
+  });
+
+  it("a relay that predates slicing (no `complete` field) reads as complete", async () => {
+    captureFetch(() => new Response(JSON.stringify({ party: "p", instruments: [] }), { status: 200 }));
+    const h = await new RelayClient({ relayUrl: "http://relay" }).holdings("agent::1");
+    expect(h.complete).toBe(true);
+  });
+
+  it("a holdings_merge_required refusal is explained with the exact merge to run", async () => {
+    captureFetch(() => new Response(JSON.stringify({
+      code: "holdings_merge_required",
+      detail: "… Consolidate first: canton-agent-wallet merge --admin cbtc::1220 --id CBTC",
+    }), { status: 413 }));
+    const err = await new RelayClient({ relayUrl: "http://relay" })
+      .payPrepare({ party: "p", receiver: "m", amount: "1" })
+      .catch((e: unknown) => e as Error);
+    expect(err.message).toMatch(/must be consolidated.*canton-agent-wallet merge --admin cbtc::1220 --id CBTC/s);
+  });
+});
+
+describe("RelayClient — request timeout", () => {
+  const hang = () =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((_url: string, init: RequestInit = {}) =>
+        new Promise((_res, rej) => {
+          init.signal?.addEventListener("abort", () => rej(init.signal!.reason));
+        })
+      )
+    );
+
+  it("a hung read fails with RelayTimeoutError instead of hanging forever", async () => {
+    hang();
+    const err = await new RelayClient({ relayUrl: "http://relay", timeoutMs: 20 }).balance("agent::1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayTimeoutError);
+    expect((err as RelayTimeoutError).outcomeUnknown).toBe(false);
+  });
+
+  it("a timed-out SUBMISSION is reported as outcome-unknown — check balance, do not retry blind", async () => {
+    hang();
+    const err = await new RelayClient({ relayUrl: "http://relay", timeoutMs: 20 }).submitExecute({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayTimeoutError);
+    expect((err as RelayTimeoutError).outcomeUnknown).toBe(true);
+    expect((err as Error).message).toMatch(/may still commit.*balance/);
+  });
+
+  it("CANTON_AGENT_RELAY_TIMEOUT_MS sets the default; an explicit timeoutMs wins", () => {
+    process.env.CANTON_AGENT_RELAY_TIMEOUT_MS = "1234";
+    try {
+      expect((new RelayClient({ relayUrl: "http://r" }) as unknown as { timeoutMs: number }).timeoutMs).toBe(1234);
+      expect((new RelayClient({ relayUrl: "http://r", timeoutMs: 5 }) as unknown as { timeoutMs: number }).timeoutMs).toBe(5);
+    } finally {
+      delete process.env.CANTON_AGENT_RELAY_TIMEOUT_MS;
+    }
+    expect((new RelayClient({ relayUrl: "http://r" }) as unknown as { timeoutMs: number }).timeoutMs).toBe(DEFAULT_RELAY_TIMEOUT_MS);
   });
 });

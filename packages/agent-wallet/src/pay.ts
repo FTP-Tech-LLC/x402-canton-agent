@@ -2,17 +2,23 @@
  * makePayingFetch — a drop-in fetch that auto-pays x402 challenges from the
  * agent's self-custody wallet. Lazily creates the wallet on first use, then
  * wraps fetch so any 402 is paid (relay PREPARES a token-standard
- * TransferFactory_Transfer → verify-before-sign → sign locally → the relay
- * stashes it for the facilitator to settle) and the request retried. The agent
- * just "fetches".
+ * TransferFactory_Transfer → verify-before-sign → sign locally → the signed
+ * transaction rides INLINE in the payment payload for the facilitator to settle)
+ * and the request retried. The agent just "fetches".
  */
 import {
   wrapFetchWithCantonPayment,
+  peekChosenRequirement,
   peekChosenTransferMethod,
 } from "@ftptech/x402-canton-client";
 import { assetMatches, type PaymentRequirements } from "@ftptech/x402-canton-core";
 import { ensureWallet, type EnsureWalletOpts } from "./onboard.js";
 import { makeRelaySigner } from "./relay-signer.js";
+import {
+  isTrustedRegistryAdmin,
+  resolveSwapSymbol,
+  resolveTrustedRegistryParties,
+} from "./registry-parties.js";
 import { withPayLock } from "./pay-lock.js";
 import { walletDir, type AgentWallet } from "./store.js";
 import type { HashBindingOptions } from "./verify-prepared.js";
@@ -40,6 +46,10 @@ export interface PayOpts extends EnsureWalletOpts {
    *  agent to sign a charge larger than the caller authorized. Omitted → no
    *  ceiling (the published MCP/pay path is unaffected when unset). */
   maxPaymentValue?: string;
+  /** Per-instrument ceilings for registry tokens, keyed `"<admin>|<id>"`, in that
+   *  token's own ledger Decimal (see makeRelaySigner). `maxPaymentValue` is
+   *  denominated in Canton Coin and never caps a token. */
+  maxPaymentValueByInstrument?: Readonly<Record<string, string>>;
   /** Optional expected-payee pin threaded into the relay signer: the ONLY
    *  recipient the signer will sign a transfer to. When set, the autopay REFUSES
    *  to sign if the 402's payTo is anything else (MITM'd-merchant defense).
@@ -75,13 +85,44 @@ export function buildPreferAssetSelector(
 ): ((cands: PaymentRequirements[]) => PaymentRequirements) | undefined {
   if (!preferAsset) return undefined;
   const want = preferAsset.toLowerCase();
-  return (cands: PaymentRequirements[]): PaymentRequirements => {
-    const hit = cands.find(
-      (a) =>
-        assetMatches(a.asset, preferAsset) ||
-        a.asset.toLowerCase() === want ||
-        a.extra?.instrumentId?.id?.toLowerCase() === want
+  // A symbol this wallet knows is matched on WHAT IS PAID — the structured
+  // instrumentId the signer acts on — never on the 402's free-text `asset`
+  // label, which a merchant can set to anything. Otherwise `--asset USDCx`
+  // (and a USDCx spend cap) could pick an entry labelled "USDCx" that actually
+  // pays Canton Coin.
+  // The MainNet registrar is baked in; on testnet/devnet the same symbol comes
+  // from a registrar trusted through CANTON_AGENT_REGISTRY_TRUSTED_PARTIES, so the
+  // instrument id from any TRUSTED registrar matches (an arbitrary admin still
+  // does not), and the MainNet registrar's entry wins when both are offered.
+  const known = resolveSwapSymbol(preferAsset);
+  const exact = (a: PaymentRequirements): boolean => {
+    const inst = a.extra?.instrumentId;
+    return (
+      known.kind === "registry" &&
+      inst?.admin === known.instrument.admin &&
+      inst?.id === known.instrument.id
     );
+  };
+  const matches = (a: PaymentRequirements): boolean => {
+    const inst = a.extra?.instrumentId;
+    if (known.kind === "registry") {
+      return (
+        inst?.id === known.instrument.id &&
+        typeof inst.admin === "string" &&
+        isTrustedRegistryAdmin(inst.admin, process.env)
+      );
+    }
+    if (known.kind === "cc") {
+      return inst?.id === "Amulet" && resolveTrustedRegistryParties(inst.admin, process.env).size === 0;
+    }
+    return (
+      assetMatches(a.asset, preferAsset) ||
+      a.asset.toLowerCase() === want ||
+      inst?.id?.toLowerCase() === want
+    );
+  };
+  return (cands: PaymentRequirements[]): PaymentRequirements => {
+    const hit = cands.find(exact) ?? cands.find(matches);
     if (hit) return hit;
     const offered = [
       ...new Set(cands.map((a) => a.extra?.instrumentId?.id ?? a.asset)),
@@ -93,10 +134,63 @@ export function buildPreferAssetSelector(
   };
 }
 
+/**
+ * What a paying fetch for `wallet` WOULD pay for this 402, without paying: the
+ * accepts[] entry the same selection picks (same signer methods, same
+ * preferred-asset tiebreaker as `makePayingFetchForWallet`), its payee, its
+ * amount in atomic units, and whether it is a registry token.
+ *
+ * `registryInstrument` is undefined for Canton Coin, decided the way the signer
+ * decides it: an admin that is a known registry is a token, anything else is
+ * judged as Canton Coin (and its admin is later pinned to the DSO).
+ *
+ * `undefined` when the response is not a readable 402 or offers nothing this
+ * wallet can pay. For a caller about to spend money on the strength of the
+ * answer — funding the wallet first, say — that is a reason to stop.
+ */
+export function peekWalletPayment(
+  response: Response,
+  wallet: AgentWallet,
+  opts: Pick<PayOpts, "preferAsset"> = {}
+):
+  | {
+      payTo: string;
+      amountAtomic: string;
+      registryInstrument?: { admin: string; id: string };
+    }
+  | undefined {
+  const selectRequirements = buildPreferAssetSelector(opts.preferAsset);
+  let chosen: PaymentRequirements | undefined;
+  try {
+    chosen = peekChosenRequirement(
+      response,
+      makeRelaySigner(wallet, {}),
+      selectRequirements ? { selectRequirements } : {}
+    );
+  } catch {
+    // A preferred asset the 402 does not offer throws in the selector; for a
+    // peek that is "nothing payable", not an error to propagate.
+    return undefined;
+  }
+  if (!chosen) return undefined;
+  const inst = chosen.extra?.instrumentId;
+  const isRegistry =
+    inst !== undefined && resolveTrustedRegistryParties(inst.admin, process.env).size > 0;
+  return {
+    payTo: chosen.payTo,
+    amountAtomic: chosen.amount,
+    ...(isRegistry ? { registryInstrument: { admin: inst.admin, id: inst.id } } : {}),
+  };
+}
+
 export async function makePayingFetch(
   opts: PayOpts
 ): Promise<typeof globalThis.fetch> {
-  const wallet = await ensureWallet(opts);
+  // `relayUrl` is the relay to pay through. An EXISTING wallet used to keep the
+  // relay saved at `create` time and silently ignore this — so pointing a wallet
+  // at another facilitator (a cut-over, a staging relay) still paid through the
+  // old one. The saved wallet file is not changed; only this fetch uses it.
+  const wallet = { ...(await ensureWallet(opts)), relayUrl: opts.relayUrl };
   // The file-backed wallet serializes concurrent pays via a directory mutex in
   // its home (cross-process safe), so pass the home as the lock dir — behavior
   // is identical to before this was extracted.
@@ -104,10 +198,10 @@ export async function makePayingFetch(
 }
 
 /**
- * Like makePayingFetch but for a wallet OBJECT you already hold — used by the
- * hosted quest one-shot, which mints a FRESH ephemeral wallet per request
- * (`ensureWallet({ ephemeral: true })`) and pays from it without ever persisting
- * it to disk. `lockHome` is the directory for the per-wallet pay mutex; OMIT it
+ * Like makePayingFetch but for a wallet OBJECT you already hold — a wallet
+ * reconstructed in memory (`ensureWallet({ ephemeral: true })`, or a key a hosted
+ * service keeps in its own store) that must be paid from without ever being
+ * written to this process's home. `lockHome` is the directory for the per-wallet pay mutex; OMIT it
  * for an ephemeral wallet — a throwaway wallet does exactly one pay, so there is
  * no same-wallet concurrency to serialize and no home directory to lock in.
  */
@@ -119,6 +213,7 @@ export async function makePayingFetchForWallet(
     | "hashBinding"
     | "maxPaymentRetries"
     | "maxPaymentValue"
+    | "maxPaymentValueByInstrument"
     | "expectedPayTo"
     | "preferAsset"
   >,
@@ -129,6 +224,9 @@ export async function makePayingFetchForWallet(
     ...(opts.hashBinding ? { hashBinding: opts.hashBinding } : {}),
     ...(opts.maxPaymentValue !== undefined
       ? { maxPaymentValue: opts.maxPaymentValue }
+      : {}),
+    ...(opts.maxPaymentValueByInstrument !== undefined
+      ? { maxPaymentValueByInstrument: opts.maxPaymentValueByInstrument }
       : {}),
     ...(opts.expectedPayTo !== undefined
       ? { expectedPayTo: opts.expectedPayTo }

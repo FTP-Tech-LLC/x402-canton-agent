@@ -10,7 +10,10 @@ import {
   MISSING_RELAY_HELP,
   withdrawAmount,
   preapprovalMode,
+  payLimits,
+  preapprovalInstrumentId,
 } from "./cli-args.js";
+import { KNOWN_INSTRUMENTS, instrumentKey } from "./registry-parties.js";
 
 describe("cli-args.flag", () => {
   it("returns the value after the flag", () => {
@@ -314,5 +317,74 @@ describe("--flag=value is the same instruction as --flag value", () => {
       "https://api.example.com/data",
     ]);
     expect(flag(["--asset", "USDCx", "https://api.example.com/data"], "--asset")).toBe("USDCx");
+  });
+});
+
+describe("pay --max / --pay-to", () => {
+  const usdcx = KNOWN_INSTRUMENTS.USDCx!;
+  it("no flags → no limits (unchanged behaviour)", () => {
+    expect(payLimits(["https://x"])).toEqual({ kind: "ok" });
+  });
+  it("--max without --asset caps Canton Coin", () => {
+    expect(payLimits(["--max", "0.5", "https://x"])).toEqual({ kind: "ok", maxPaymentValue: "0.5" });
+    expect(payLimits(["--max=2", "https://x"])).toEqual({ kind: "ok", maxPaymentValue: "2" });
+  });
+  it("--max with a registry --asset caps THAT token, keyed admin|id", () => {
+    expect(payLimits(["--asset", "usdcx", "--max", "0.1", "https://x"])).toEqual({
+      kind: "ok",
+      maxPaymentValueByInstrument: { [instrumentKey(usdcx.admin, usdcx.id)]: "0.1" },
+    });
+  });
+  it("--max with a registry --asset also caps that id from registrars trusted via env", () => {
+    // On testnet/devnet USDCx comes from a registrar trusted through
+    // CANTON_AGENT_REGISTRY_TRUSTED_PARTIES; a cap keyed only on MainNet's
+    // registrar would never apply there.
+    const env = {
+      CANTON_AGENT_REGISTRY_TRUSTED_PARTIES: JSON.stringify({ "testnet-usdcx::1220ab": ["op::1220cd"] }),
+    };
+    expect(payLimits(["--asset", "USDCx", "--max", "0.1", "u"], env)).toEqual({
+      kind: "ok",
+      maxPaymentValueByInstrument: {
+        [instrumentKey(usdcx.admin, usdcx.id)]: "0.1",
+        [instrumentKey("testnet-usdcx::1220ab", "USDCx")]: "0.1",
+      },
+    });
+  });
+  it("--max with --asset CC caps Canton Coin", () => {
+    expect(payLimits(["--asset", "CC", "--max", "1", "u"])).toEqual({ kind: "ok", maxPaymentValue: "1" });
+  });
+  it("refuses an unknown asset, an empty, zero or non-numeric --max — never pays uncapped", () => {
+    for (const a of [
+      ["--asset", "NOPE", "--max", "1", "u"],
+      ["--max", "", "u"],
+      ["--max"],
+      ["--max", "0", "u"],
+      ["--max", "1e3", "u"],
+      ["--max", "-1", "u"],
+    ]) {
+      expect(payLimits(a).kind).toBe("error");
+    }
+  });
+  it("--pay-to pins the payee; an empty one is refused", () => {
+    expect(payLimits(["--pay-to", "m::1220", "u"])).toEqual({ kind: "ok", expectedPayTo: "m::1220" });
+    expect(payLimits(["--pay-to", "", "u"]).kind).toBe("error");
+  });
+  it("the URL positional is not mistaken for a flag value (--max / --pay-to take one)", () => {
+    expect(positionals(["--max", "0.5", "--pay-to", "m::1", "https://x"])).toEqual(["https://x"]);
+  });
+});
+
+describe("preapproval --id for a registry token", () => {
+  it("--id wins", () => {
+    expect(preapprovalInstrumentId(["--id", "EURx"], KNOWN_INSTRUMENTS.USDCx!.admin)).toBe("EURx");
+  });
+  it("infers the one instrument this wallet knows for that registrar — CBTC is CBTC, not USDCx", () => {
+    expect(preapprovalInstrumentId([], KNOWN_INSTRUMENTS.CBTC!.admin)).toBe("CBTC");
+    expect(preapprovalInstrumentId([], KNOWN_INSTRUMENTS.USDCx!.admin)).toBe("USDCx");
+  });
+  it("undecidable (unknown registrar, or several instruments) → undefined, so the CLI requires --id", () => {
+    expect(preapprovalInstrumentId([], "someone::1220")).toBeUndefined();
+    // ember-silver and ember-gold share a namespace but are distinct admins; each still resolves.
+    expect(preapprovalInstrumentId([], KNOWN_INSTRUMENTS.eXAG!.admin)).toBe("eXAG");
   });
 });

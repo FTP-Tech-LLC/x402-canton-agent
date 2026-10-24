@@ -200,6 +200,51 @@ describe("spending a registry token is a separate opt-in from trusting it", () =
     );
   });
 
+  it("a cap configured only for a token refuses a Canton Coin payment (no silent uncapped CC)", async () => {
+    // `pay --asset USDCx --max 1` against a 402 whose entry is labelled USDCx
+    // but carries a Canton Coin instrumentId: without this the CC branch found
+    // no CC cap and signed any amount.
+    const f = vi.fn(async () => { throw new Error("no network"); });
+    vi.stubGlobal("fetch", f);
+    const signer = makeRelaySigner(wallet(), {
+      trustedDso: "DSO::1",
+      maxPaymentValueByInstrument: { [KEY]: "1" },
+      hashBinding: { recomputeHash: RECOMPUTE },
+    });
+    await expect(
+      signer.signTransferFactory!({
+        ...usdcxInput,
+        instrumentId: { admin: "DSO::1", id: "Amulet" },
+        amount: "1000000.0000000000",
+      } as never)
+    ).rejects.toThrow(/configured only for .* Canton Coin/);
+    expect(f).not.toHaveBeenCalled(); // refused before any relay call
+  });
+
+  it("a cap configured only for one token refuses a payment in another payable token", async () => {
+    // The same silence one instrument over: capping USDCx said nothing about
+    // CBTC, so a 402 whose first compatible entry is CBTC must not be signed
+    // for any amount just because CBTC is payable.
+    const f = vi.fn(async () => { throw new Error("no network"); });
+    vi.stubGlobal("fetch", f);
+    const CBTC_ADMIN =
+      "cbtc-network::12205af3b949a04776fc48cdcc05a060f6bda2e470632935f375d1049a8546a3b262";
+    const signer = makeRelaySigner(wallet(), {
+      trustedDso: "DSO::1",
+      payableInstruments: [KEY, `${CBTC_ADMIN}|CBTC`],
+      maxPaymentValueByInstrument: { [KEY]: "1" },
+      hashBinding: { recomputeHash: RECOMPUTE },
+    });
+    await expect(
+      signer.signTransferFactory!({
+        ...usdcxInput,
+        instrumentId: { admin: CBTC_ADMIN, id: "CBTC" },
+        amount: "1000.0000000000",
+      } as never)
+    ).rejects.toThrow(/configured only for .* in cbtc-network::.*\|CBTC/);
+    expect(f).not.toHaveBeenCalled(); // refused before any relay call
+  });
+
   it("leaves Canton Coin exactly as it was — no consent needed, same ceiling", async () => {
     // The discriminator against over-correcting: CC is not a registry
     // instrument, so none of the new checks may touch the path that pays today.

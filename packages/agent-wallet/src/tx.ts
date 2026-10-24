@@ -7,7 +7,7 @@
  */
 import { signHashB64 } from "./keys.js";
 import { resolveHashBinding } from "./hash-binding.js";
-import type { RelayClient } from "./relay-client.js";
+import type { PendingResult, RelayClient } from "./relay-client.js";
 import type { AgentWallet } from "./store.js";
 import {
   assertHashBinding,
@@ -16,6 +16,18 @@ import {
   assertPreparedRegistrySelfPreapproval,
   PreparedTransferMismatchError,
   assertPreparedAcceptMatches,
+  assertPreparedTcCreateBatcher,
+  assertPreparedTcCreateAllocation,
+  assertPreparedTcFundAllocation,
+  assertPreparedTcCreateOrders,
+  assertPreparedTcCancelOrder,
+  assertPreparedTcWithdrawalRequest,
+  type TcCreateBatcherExpectation,
+  type TcCreateAllocationExpectation,
+  type TcFundAllocationExpectation,
+  type TcCreateOrdersExpectation,
+  type TcCancelOrderExpectation,
+  type TcWithdrawalRequestExpectation,
   type HashBindingOptions,
   type PreparedTransferExpectation,
   type PreparedAcceptExpectation,
@@ -56,7 +68,17 @@ function rid(prefix: string): string {
  */
 type VerifySpec =
   | { kind: "cip56"; expect: PreparedTransferExpectation }
-  | { kind: "accept"; expect: PreparedAcceptExpectation };
+  | { kind: "accept"; expect: PreparedAcceptExpectation }
+  | TradecraftVerifySpec;
+
+/** The Tradecraft queued-mode shapes (see core prepared-transfer.ts). */
+export type TradecraftVerifySpec =
+  | { kind: "tcBatcher"; expect: TcCreateBatcherExpectation }
+  | { kind: "tcAllocation"; expect: TcCreateAllocationExpectation }
+  | { kind: "tcFund"; expect: TcFundAllocationExpectation }
+  | { kind: "tcOrders"; expect: TcCreateOrdersExpectation }
+  | { kind: "tcCancel"; expect: TcCancelOrderExpectation }
+  | { kind: "tcWithdrawal"; expect: TcWithdrawalRequestExpectation };
 
 /**
  * prepare (relay) → VERIFY → sign hash (local key) → execute (relay) → updateId.
@@ -110,12 +132,38 @@ async function prepareSignExecute(
   // VERIFY-BEFORE-SIGN: never sign a relay-prepared command we didn't author.
   // `verify` is required on EVERY path (transfer/accept), so there is no branch
   // that reaches signHashB64 ungated.
-  if (verify.kind === "cip56") {
-    assertPreparedTransferMatches(preparedTransaction, verify.expect);
-  } else {
-    // claim path: structurally prove the prepared tx is a single inbound
-    // TransferInstruction_Accept by the agent, not an outbound drain.
-    assertPreparedAcceptMatches(preparedTransaction, verify.expect);
+  switch (verify.kind) {
+    case "cip56":
+      assertPreparedTransferMatches(preparedTransaction, verify.expect);
+      break;
+    case "accept":
+      // claim path: structurally prove the prepared tx is a single inbound
+      // TransferInstruction_Accept by the agent, not an outbound drain.
+      assertPreparedAcceptMatches(preparedTransaction, verify.expect);
+      break;
+    case "tcBatcher":
+      assertPreparedTcCreateBatcher(preparedTransaction, verify.expect);
+      break;
+    case "tcAllocation":
+      assertPreparedTcCreateAllocation(preparedTransaction, verify.expect);
+      break;
+    case "tcFund":
+      assertPreparedTcFundAllocation(preparedTransaction, verify.expect);
+      break;
+    case "tcOrders":
+      assertPreparedTcCreateOrders(preparedTransaction, verify.expect);
+      break;
+    case "tcCancel":
+      assertPreparedTcCancelOrder(preparedTransaction, verify.expect);
+      break;
+    case "tcWithdrawal":
+      assertPreparedTcWithdrawalRequest(preparedTransaction, verify.expect);
+      break;
+    default: {
+      // Exhaustive: a new VerifySpec arm without a check here must not compile.
+      const never: never = verify;
+      throw new PreparedTransferMismatchError(`unknown verify kind ${JSON.stringify(never)}`);
+    }
   }
   // Hash binding: prove the hash we are about to sign is the hash OF THE BYTES
   // we just validated, not an opaque relay-chosen value. Without this a
@@ -147,6 +195,24 @@ async function prepareSignExecute(
     deduplicationPeriod: { Empty: {} },
   });
   return exec.updateId;
+}
+
+/**
+ * prepare → verify → sign → execute for a Tradecraft queued-mode command. The
+ * same gate as every other path: the relay-prepared bytes must pass the
+ * shape's core assertion, and the signed hash must be bound to them, or
+ * nothing is signed. Returns the updateId.
+ */
+export function executeTradecraftCommand(
+  relay: RelayClient,
+  wallet: AgentWallet,
+  commands: unknown[],
+  disclosedContracts: unknown[],
+  verify: TradecraftVerifySpec,
+  hashBinding?: HashBindingOptions,
+  synchronizerId?: string
+): Promise<string> {
+  return prepareSignExecute(relay, wallet, commands, disclosedContracts, verify, hashBinding, synchronizerId);
 }
 
 /**
@@ -345,8 +411,8 @@ export async function payViaTransferFactory(
     memo?: string;
     /** Venue-attribution meta to stamp into the relay-prepared transfer's meta
      *  alongside `x402.memo` (e.g. `{ "ftp/venue": "ftp/agentic-wallet" }`). Set by
-     *  the signer for a registry-token payment when the wallet configures a venue
-     *  tag; advisory, forwarded to the relay's pay/prepare. Omitted → no venue tag. */
+     *  the signer for a registry-token payment (on by default, see venue.ts);
+     *  advisory, forwarded to the relay's pay/prepare. Omitted → no venue tag. */
     venueMeta?: Record<string, string>;
     /** OUT-OF-BAND-trusted registry infra parties (operator / bridge) for a
      *  non-Amulet registry token — admitted by the foreign-party backstop. See
@@ -434,78 +500,6 @@ export async function payViaTransferFactory(
 }
 
 /**
- * Per-wallet in-process reservation of input-holding cids. The token-standard
- * transfer path has NO nonce, so concurrent pays from one wallet are allowed —
- * BUT two concurrent transfers must not pick the SAME Amulet holding: the first
- * to settle archives it, and the second's already-prepared tx then references an
- * archived contract → HTTP 400 at /v2/interactive-submission/prepare (or at
- * execute). To keep concurrent transfers disjoint we pick the SMALLEST single
- * free holding that covers the amount and reserve its cid for the duration of the
- * prepare→sign→execute dance; a sibling transfer then skips it and picks the next
- * one. Released in `finally` (success OR throw).
- *
- * LIMITATION (documented): this Map is in-memory, so it only de-conflicts
- * concurrency WITHIN one process. Two separate processes paying from the same
- * wallet can still pick the same holding — that loser fails closed (400) and the
- * client's bounded re-pay loop retries with a fresh balance read, by which point
- * the winner has released. No double-spend is possible: verify-before-sign + the
- * facilitator re-validate every settle, so a lost race only costs a retry.
- */
-const reservedHoldings = new Map<string, Set<string>>();
-
-/** @internal Exported for unit tests (disjoint selection + release). Not part of
- *  the public API. */
-export function reserveHolding(
-  party: string,
-  holdings: Array<{ cid: string; amount: string }>,
-  amount: string
-): { cids: string[]; release: () => void } {
-  const want = Number(amount);
-  let set = reservedHoldings.get(party);
-  if (!set) {
-    set = new Set<string>();
-    reservedHoldings.set(party, set);
-  }
-  const free = holdings.filter((h) => !set.has(h.cid));
-  // Prefer the SMALLEST single free holding that covers the amount — leaving the
-  // larger holdings free for sibling concurrent allocates.
-  const single = free
-    .filter((h) => Number(h.amount) >= want)
-    .sort((a, b) => Number(a.amount) - Number(b.amount))[0];
-  let chosen: Array<{ cid: string; amount: string }>;
-  if (single) {
-    chosen = [single];
-  } else {
-    // No single free holding covers it → accumulate free holdings largest-first
-    // until they cover the amount.
-    const byDesc = [...free].sort((a, b) => Number(b.amount) - Number(a.amount));
-    chosen = [];
-    let acc = 0;
-    for (const h of byDesc) {
-      chosen.push(h);
-      acc += Number(h.amount);
-      if (acc >= want) break;
-    }
-    // Nothing free at all (every holding reserved by a sibling) → fall back to the
-    // full set (legacy behavior). A sibling may archive these first → the prepared
-    // tx 400s → the client re-pay loop retries, by which point a sibling released.
-    if (chosen.length === 0) chosen = holdings;
-  }
-  const cids = chosen.map((h) => h.cid);
-  for (const c of cids) set.add(c);
-  let released = false;
-  const release = (): void => {
-    if (released) return;
-    released = true;
-    const s = reservedHoldings.get(party);
-    if (!s) return;
-    for (const c of cids) s.delete(c);
-    if (s.size === 0) reservedHoldings.delete(party);
-  };
-  return { cids, release };
-}
-
-/**
  * True when a relay prepare/execute failure is a STALE input-holding rejection:
  * the participant reports the chosen input contract already archived
  * (`UNKNOWN_CONTRACT_SYNCHRONIZERS` / "have been archived") OR unresolvable
@@ -540,6 +534,52 @@ export function isStaleInputHoldingError(err: unknown): boolean {
     cur = e.cause;
   }
   return false;
+}
+
+/** What `claimAll` does with one pending row. */
+export type PendingVerdict =
+  | { kind: "expired" }
+  | { kind: "untrusted"; admin: string }
+  | { kind: "claimable"; registryAdmin?: string };
+
+/**
+ * How `claimAll` treats a pending row, exported so a caller can say what a
+ * claim would accept without running one.
+ *
+ * Expired: the relay reports executeBefore and it has passed; the ledger would
+ * refuse the accept.
+ *
+ * Canton Coin is recognised by the LOCAL DSO anchor (`trustedDso`), not by the
+ * row's own label: a registrar that names a token "Amulet" is still a
+ * registrar. Without a known DSO for this network the id is all there is to go
+ * on. /pending names the instrument on every row (for Canton Coin it is the
+ * DSO + "Amulet"), and a registry instruction's accept context lives on ITS
+ * registry, so `registryAdmin` is set only for a registry token.
+ *
+ * Untrusted: the trust anchor for a registry claim is LOCAL (the baked-in
+ * table or the operator's env), never the relay's row. A registrar this wallet
+ * has no anchor for cannot be verified — the honest accept names the registry
+ * operator and bridge, which verify would rightly call foreign — so the row is
+ * skipped instead of being prepared and refused (a refusal is treated as
+ * evidence about the relay and stops the loop).
+ */
+export function classifyPending(
+  p: PendingResult["pending"][number],
+  trustedDso: string | undefined,
+  nowMs: number,
+  env: NodeJS.ProcessEnv = process.env
+): PendingVerdict {
+  if (p.executeBefore !== undefined && Date.parse(p.executeBefore) <= nowMs) {
+    return { kind: "expired" };
+  }
+  const isCantonCoin =
+    p.instrumentId === undefined ||
+    (p.instrumentId.id === "Amulet" &&
+      (trustedDso === undefined || p.instrumentId.admin === trustedDso));
+  if (isCantonCoin) return { kind: "claimable" };
+  const admin = p.instrumentId!.admin;
+  if (!isTrustedRegistryAdmin(admin, env)) return { kind: "untrusted", admin };
+  return { kind: "claimable", registryAdmin: admin };
 }
 
 /**
@@ -590,35 +630,18 @@ export async function claimAll(
     // expired offer (the ledger answers deadline-exceeded to its accept) made
     // every newer, perfectly claimable one unreachable. Measured live: three
     // expired USDCx offers ahead of one live one, claim failed, balance stayed
-    // 0. Expired ones are skipped up front when the relay reports
-    // executeBefore; anything else that fails is recorded and the loop goes on.
-    if (p.executeBefore !== undefined && Date.parse(p.executeBefore) <= nowMs) {
+    // 0. Expired and unanchored rows are skipped up front (classifyPending);
+    // anything else that fails is recorded and the loop goes on.
+    const verdict = classifyPending(p, trustedDso, nowMs);
+    if (verdict.kind === "expired") {
       skippedExpired += 1;
       continue;
     }
-    // A registry instruction's accept context lives on ITS registry, not the
-    // SV Scan. /pending names the instrument on EVERY row (the
-    // TransferInstructionV1 view always carries one — for Canton Coin it is the
-    // DSO + "Amulet"), so the admin is forwarded only for a registry token; an
-    // Amulet row keeps the SV Scan path it always had.
-    // Canton Coin is recognised by the LOCAL DSO anchor, not by the row's own
-    // label: a registrar that names a token "Amulet" is still a registrar.
-    // Without a known DSO for this network the id is all there is to go on.
-    const isCantonCoin =
-      p.instrumentId === undefined ||
-      (p.instrumentId.id === "Amulet" &&
-        (trustedDso === undefined || p.instrumentId.admin === trustedDso));
-    const registryAdmin = isCantonCoin ? undefined : p.instrumentId!.admin;
-    // The trust anchor for a registry claim is LOCAL (the baked-in table or
-    // the operator's env), never the relay's row. A registrar this wallet has
-    // no anchor for cannot be verified — the honest accept names the registry
-    // operator and bridge, which verify would rightly call foreign — so the
-    // row is skipped here instead of being prepared and refused (a refusal is
-    // treated as evidence about the relay and stops the loop).
-    if (registryAdmin !== undefined && !isTrustedRegistryAdmin(registryAdmin, process.env)) {
-      skippedUntrusted.push({ cid: p.cid, admin: registryAdmin });
+    if (verdict.kind === "untrusted") {
+      skippedUntrusted.push({ cid: p.cid, admin: verdict.admin });
       continue;
     }
+    const { registryAdmin } = verdict;
     try {
     const ctx = await relay.resolveAccept({
       instructionCid: p.cid,
@@ -706,13 +729,28 @@ const SELF_PREAPPROVAL_STALE_BACKOFF_MS = [1000, 2000, 4000, 8000, 12000];
 export async function selfProvisionPreapproval(
   relay: RelayClient,
   wallet: AgentWallet,
-  opts?: { expiresAt?: string; hashBinding?: HashBindingOptions },
+  opts?: {
+    expiresAt?: string;
+    hashBinding?: HashBindingOptions;
+    /** The network's DSO, out of band. Defaults to resolveTrustedDsoParty for
+     *  the wallet's network; without one the relay-built tree cannot be
+     *  verified and nothing is signed. */
+    dso?: string;
+  },
   sleep: (ms: number) => Promise<void> = (ms) =>
     new Promise((r) => setTimeout(r, ms))
 ): Promise<{ updateId: string }> {
   // ONE attempt: relay builds the CreateTransferPreapproval over the merchant's
   // CURRENT fee-input Amulet cids (prepare), the merchant signs, the relay
   // executes (commit).
+  const dso = opts?.dso ?? resolveTrustedDsoParty(process.env, wallet.network);
+  if (dso === undefined) {
+    throw new PreparedTransferMismatchError(
+      `self-preapproval: no trusted DSO party for network ${JSON.stringify(wallet.network)} — ` +
+        `set CANTON_AGENT_DSO_PARTY (or pass --admin <DSO>); the relay-built transaction cannot ` +
+        `be verified without it, so nothing is signed`
+    );
+  }
   const attempt = async (): Promise<{ updateId: string }> => {
     const prep = await relay.preapprovalSelfPrepare(wallet.party, opts?.expiresAt);
     // Never sign a relay tx that does anything other than create OUR preapproval.
@@ -720,11 +758,11 @@ export async function selfProvisionPreapproval(
     // Passing it back binds the bytes to that statement: a relay that says 90
     // days and encodes ten years is caught, and a caller who asked for a
     // specific date gets it checked below.
-    assertPreparedSelfPreapproval(
-      prep.preparedTransaction,
-      wallet.party,
-      prep.expiresAt
-    );
+    assertPreparedSelfPreapproval(prep.preparedTransaction, {
+      party: wallet.party,
+      dso,
+      expectedExpiresAt: prep.expiresAt,
+    });
     if (opts?.expiresAt !== undefined && prep.expiresAt !== opts.expiresAt) {
       throw new PreparedTransferMismatchError(
         `self-preapproval: asked for expiresAt ${JSON.stringify(opts.expiresAt)} but the relay ` +

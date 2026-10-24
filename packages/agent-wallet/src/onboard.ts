@@ -15,6 +15,11 @@ import {
   OnboardingTopologyMismatchError,
 } from "./verify-prepared.js";
 import { recomputeTopologyMultiHash, fingerprintHex } from "./canton-hash.js";
+import {
+  acceptStarterGrant,
+  type StarterGrant,
+  type StarterGrantResult,
+} from "./starter-grant.js";
 
 export interface EnsureWalletOpts {
   relayUrl: string;
@@ -34,11 +39,29 @@ export interface EnsureWalletOpts {
   /** Ephemeral mode: mint a FRESH wallet on every call and NEVER touch the
    *  on-disk store — skip `loadWallet` (always onboard a new key) and skip
    *  `saveWallet` (the full key material is returned in the wallet object for the
-   *  caller to hand off; nothing is persisted by us). Used by the hosted quest
-   *  one-shot, which mints a throwaway wallet per request and returns its key to
-   *  the user. Every verify-before-sign leg still runs — only the file I/O is
-   *  skipped. Independent of `restore`. */
+   *  caller to hand off; nothing is persisted by us). For a caller that keeps
+   *  keys in its own store (a hosted wallet service) rather than in this
+   *  process's home. Every verify-before-sign leg still runs — only the file I/O
+   *  is skipped. Independent of `restore`. */
   ephemeral?: boolean;
+  /**
+   * The relay may pay every newly created wallet a starter grant; it says so
+   * in its onboard/finalize answer, and the grant lands shortly after as a
+   * pending transfer only this wallet can accept.
+   *   "wait" (default): accept it before returning (up to
+   *     `starterGrantTimeoutMs`), so the wallet comes back funded.
+   *   "background": return at once and accept it in the background; for a
+   *     long-lived process that cannot hold a caller for another half minute.
+   *   "leave": leave the offer pending; `claim` accepts it later.
+   * An existing or restored wallet gets no grant; none of this runs for it.
+   */
+  starterGrant?: "wait" | "background" | "leave";
+  /** How long "wait" / "background" watch for the grant. Default 90 s. */
+  starterGrantTimeoutMs?: number;
+  /** Poll interval while watching for the grant. Default 3 s. */
+  starterGrantPollMs?: number;
+  /** Told how the starter grant ended, once it has. */
+  onStarterGrant?: (r: StarterGrantResult) => void;
 }
 
 export async function ensureWallet(opts: EnsureWalletOpts): Promise<AgentWallet> {
@@ -115,6 +138,7 @@ export async function ensureWallet(opts: EnsureWalletOpts): Promise<AgentWallet>
   // persist the party that prepare+verify just proved binds our key. The
   // verify-before-sign legs above run on BOTH paths (the security invariant).
   let party = prep.party;
+  let grant: StarterGrant | undefined;
   if (!opts.restore) {
     const signature = {
       format: ED25519_WIRE_CONSTANTS.signatureFormat,
@@ -135,6 +159,10 @@ export async function ensureWallet(opts: EnsureWalletOpts): Promise<AgentWallet>
     // checked against publicKeyFingerprint above); if the finalize step returns a
     // different party, it must STILL be in that same verified namespace, else a
     // relay could swap the persisted identity after the topology check. Fail-closed.
+    if (fin.starterGrant?.status === "scheduled" && typeof fin.starterGrant.amountCc === "string") {
+      grant = { amountCc: fin.starterGrant.amountCc };
+    }
+
     party = fin.party || prep.party;
     if (party !== prep.party) {
       const sep = party.lastIndexOf("::");
@@ -177,9 +205,23 @@ export async function ensureWallet(opts: EnsureWalletOpts): Promise<AgentWallet>
     createdAt: new Date().toISOString(),
   };
   // Ephemeral wallets are returned to the caller (with full key material) but
-  // NEVER written to disk — the quest one-shot hands the key to the user and
-  // keeps no copy.
+  // NEVER written to disk — the caller decides where the key lives.
   if (!opts.ephemeral) saveWallet(wallet);
+
+  const mode = opts.starterGrant ?? "wait";
+  if (grant && mode !== "leave") {
+    const settled = acceptStarterGrant(relay, wallet, grant, {
+      ...(opts.starterGrantTimeoutMs !== undefined ? { timeoutMs: opts.starterGrantTimeoutMs } : {}),
+      ...(opts.starterGrantPollMs !== undefined ? { pollMs: opts.starterGrantPollMs } : {}),
+    }).then((r) => {
+      try {
+        opts.onStarterGrant?.(r);
+      } catch {
+        /* a throwing observer must not fail the wallet it is observing */
+      }
+    });
+    if (mode === "wait") await settled;
+  }
   return wallet;
 }
 

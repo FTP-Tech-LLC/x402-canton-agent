@@ -127,6 +127,7 @@ describe("withdraw of a registry token reads HoldingV1, not /balance", () => {
           { cid: "u2", amount: "0.0200000000", locked: false },
           { cid: "uL", amount: "1.0000000000", locked: true },
         ]}],
+        complete: true,
       }),
     };
     const tx = await import("./tx.js");
@@ -165,7 +166,7 @@ describe("withdraw stamps the venue attribution tag on any registry token, never
   const wallet = { party: "agent::1220a", privateKeyPkcs8Pem: "x", publicKeyFingerprint: "f", network: "canton:mainnet", relayUrl: "http://r" };
   const registryRelay = (admin: string, id: string) => ({
     balance: async () => { throw new Error("/balance must NOT be consulted for a registry withdraw"); },
-    holdings: async () => ({ party: wallet.party, instruments: [{ admin, id, total: "1.0000000000", holdings: [{ cid: "h1", amount: "1.0000000000", locked: false }] }] }),
+    holdings: async () => ({ party: wallet.party, instruments: [{ admin, id, total: "1.0000000000", holdings: [{ cid: "h1", amount: "1.0000000000", locked: false }] }], complete: true }),
   });
   const ccRelay = () => ({
     balance: async () => ({ party: wallet.party, amulet: 1, cc: "1.0000000000", holdings: [{ cid: "c1", amount: "1.0000000000" }] }),
@@ -196,8 +197,23 @@ describe("withdraw stamps the venue attribution tag on any registry token, never
     expect((seen!.meta as Record<string, string>)?.["ftp/venue"]).toBe("ftp/agentic-wallet");
   });
 
-  it("stamps NOTHING on a CBTC withdraw when the env is unset", async () => {
+  it("stamps the default ftp/venue on a CBTC withdraw when the env is unset", async () => {
+    delete process.env.CANTON_AGENT_VENUE_KEY;
+    delete process.env.CANTON_AGENT_VENUE_TAG;
     const seen = await capture(registryRelay(CBTC.admin, "CBTC"), { to: "m::1220m", instrumentAdmin: CBTC.admin, instrumentId: "CBTC" });
+    expect(seen!.meta).toEqual({ "ftp/venue": "ftp/agentic-wallet" });
+  });
+
+  it("stamps NOTHING on a CBTC withdraw when CANTON_AGENT_VENUE_KEY=off", async () => {
+    process.env.CANTON_AGENT_VENUE_KEY = "off";
+    const seen = await capture(registryRelay(CBTC.admin, "CBTC"), { to: "m::1220m", instrumentAdmin: CBTC.admin, instrumentId: "CBTC" });
+    expect(seen!.meta).toBeUndefined();
+  });
+
+  it("does NOT stamp a Canton Coin withdraw with the env unset (default never reaches CC)", async () => {
+    delete process.env.CANTON_AGENT_VENUE_KEY;
+    delete process.env.CANTON_AGENT_VENUE_TAG;
+    const seen = await capture(ccRelay(), { to: "m::1220m", instrumentAdmin: "DSO::1220d" });
     expect(seen!.meta).toBeUndefined();
   });
 
@@ -211,5 +227,136 @@ describe("withdraw stamps the venue attribution tag on any registry token, never
     setEnv();
     const seen = await capture(registryRelay(CBTC.admin, "CBTC"), { to: "m::1220m", instrumentAdmin: CBTC.admin, instrumentId: "CBTC", meta: { "tc.min": "1.23" } });
     expect(seen!.meta).toMatchObject({ "ftp/venue": "ftp/agentic-wallet", "tc.min": "1.23" });
+  });
+});
+
+describe("withdraw reports whether the funds LANDED or await the receiver's claim", () => {
+  // A transfer to a receiver with no TransferPreapproval settles as a pending
+  // offer: on-ledger, but not spendable by them until they `claim`. Reporting
+  // that identically to a direct settle told a sender "withdrew N to <party>"
+  // for money the party did not have — the case that made a top-up look done
+  // while the recipient still saw its old balance.
+  const wallet = { party: "agent::1220a", privateKeyPkcs8Pem: "x", publicKeyFingerprint: "f", network: "canton:mainnet", relayUrl: "http://r" };
+  const relayWith = (status: unknown) => ({
+    balance: async () => ({ party: wallet.party, amulet: 1, cc: "5.0000000000", holdings: [{ cid: "c1", amount: "5.0000000000" }] }),
+    holdings: async () => { throw new Error("/holdings must NOT be needed for a CC withdraw"); },
+    preapprovalStatus: async () => {
+      if (status instanceof Error) throw status;
+      return status;
+    },
+  });
+
+  async function run(relay: unknown): Promise<boolean | null> {
+    const tx = await import("./tx.js");
+    const spy = vi.spyOn(tx, "transfer").mockResolvedValue("u1" as never);
+    const r = await withdraw({
+      relay: relay as never,
+      wallet: wallet as never,
+      hashBinding: {},
+      to: "m::1220m",
+      amount: "1",
+      instrumentAdmin: "DSO::1220d",
+    } as never);
+    spy.mockRestore();
+    return r.landed;
+  }
+
+  it("landed=true when the receiver holds a preapproval (direct settle)", async () => {
+    expect(await run(relayWith({ hasPreapproval: true, transferKind: "direct" }))).toBe(true);
+  });
+
+  it("landed=false when the receiver has none — the money awaits their claim", async () => {
+    expect(await run(relayWith({ hasPreapproval: false, transferKind: "offer" }))).toBe(false);
+  });
+
+  it("landed=null when the relay cannot say — UNKNOWN is never reported as delivered", async () => {
+    expect(await run(relayWith({ hasPreapproval: null, transferKind: "direct" }))).toBeNull();
+  });
+
+  it("a failing status query costs the label, never the transfer", async () => {
+    // The transfer already committed; a status error must not turn a completed
+    // withdraw into a thrown one.
+    expect(await run(relayWith(new Error("relay down")))).toBeNull();
+  });
+});
+
+describe("withdraw of a registry token from a wallet past the participant list cap", () => {
+  // The relay answers a bounded slice of the oldest holdings (complete:false).
+  // Enough to spend from; never enough to quote a balance.
+  const USDCX = "usdcx-admin::1220";
+  const wallet = { party: "agent::1220a", privateKeyPkcs8Pem: "x", publicKeyFingerprint: "f", network: "canton:mainnet", relayUrl: "http://r" };
+  const rows = (n: number, amount: string) =>
+    Array.from({ length: n }, (_, i) => ({ cid: `u${i}`, amount, locked: false }));
+  const relayOf = (holdings: Array<{ cid: string; amount: string; locked: boolean }>, complete: boolean) => {
+    const calls: unknown[][] = [];
+    return {
+      calls,
+      relay: {
+        balance: async () => { throw new Error("no /balance for a registry withdraw"); },
+        holdings: async (...a: unknown[]) => {
+          calls.push(a);
+          return { party: wallet.party, instruments: [{ admin: USDCX, id: "USDCx", total: "0", holdings }], complete };
+        },
+        preapprovalStatus: async () => ({ hasPreapproval: null }),
+      },
+    };
+  };
+  async function run(relay: unknown, amount?: string) {
+    let seen: Record<string, unknown> | undefined;
+    const tx = await import("./tx.js");
+    const spy = vi.spyOn(tx, "transfer").mockImplementation(async (_r, _w, o) => { seen = o as never; return "upd"; });
+    try {
+      const r = await withdraw({ to: "merchant::1220m", instrumentAdmin: USDCX, instrumentId: "USDCx", relay: relay as never, wallet: wallet as never, hashBinding: {}, ...(amount ? { amount } : {}) });
+      return { r, seen };
+    } finally {
+      spy.mockRestore();
+    }
+  }
+
+  it("asks the relay for a bounded slice", async () => {
+    const { relay, calls } = relayOf(rows(3, "1.0000000000"), true);
+    await run(relay, "1");
+    expect(calls[0]![2]).toEqual({ slice: true });
+  });
+
+  it("spends only the fewest, largest holdings that cover the amount", async () => {
+    const holdings = [
+      { cid: "small", amount: "0.1000000000", locked: false },
+      { cid: "big", amount: "5.0000000000", locked: false },
+      { cid: "mid", amount: "1.0000000000", locked: false },
+    ];
+    const { relay } = relayOf(holdings, true);
+    const { seen } = await run(relay, "5.5");
+    expect(seen!.inputHoldingCids).toEqual(["big", "mid"]);
+    expect(seen!.amount).toBe("5.5");
+  });
+
+  it("refuses a full (no --amount) withdraw on an incomplete slice — the balance is unknown", async () => {
+    const { relay } = relayOf(rows(200, "0.0100000000"), false);
+    await expect(run(relay)).rejects.toThrow(/full balance is not known.*merge --admin usdcx-admin::1220 --id USDCx/);
+  });
+
+  it("a shortfall on an incomplete slice points at merge, not 'insufficient funds'", async () => {
+    const { relay } = relayOf(rows(200, "0.0100000000"), false);
+    const err = await run(relay, "5").catch((e: unknown) => e as Error);
+    expect(err.message).toMatch(/only 2\.0000000000 USDCx is visible/);
+    expect(err.message).not.toMatch(/insufficient funds/);
+  });
+
+  it("from a slice, an amount spread over more than 90 holdings is refused up front with a merge hint", async () => {
+    const { relay } = relayOf(rows(200, "0.0100000000"), false);
+    await expect(run(relay, "1.0")).rejects.toThrow(/more than 90 holdings/);
+  });
+
+  it("a complete read keeps the old behaviour: a full withdraw spends every holding", async () => {
+    const { relay } = relayOf(rows(150, "0.0100000000"), true);
+    const { seen } = await run(relay);
+    expect((seen!.inputHoldingCids as string[]).length).toBe(150);
+  });
+
+  it("a coverable amount on an incomplete slice goes through", async () => {
+    const { relay } = relayOf(rows(200, "0.0100000000"), false);
+    const { seen } = await run(relay, "0.5");
+    expect((seen!.inputHoldingCids as string[]).length).toBe(50);
   });
 });

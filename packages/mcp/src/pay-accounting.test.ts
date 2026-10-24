@@ -5,10 +5,14 @@ import { join } from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { readLedger } from "./policy.js";
+import type * as AgentWallet from "@ftptech/canton-agent-wallet";
 
 const balance = { cc: 20 };
 
-vi.mock("@ftptech/canton-agent-wallet", () => ({
+// The real module underneath, with only the ledger-touching pieces replaced:
+// a full-replacement mock breaks every time server.ts gains an import.
+vi.mock("@ftptech/canton-agent-wallet", async (importOriginal) => ({
+  ...(await importOriginal<typeof AgentWallet>()),
   ensureWallet: async () => ({
     party: "agent::1220aaa",
     relayUrl: "https://relay.test",
@@ -24,14 +28,9 @@ vi.mock("@ftptech/canton-agent-wallet", () => ({
   saveWallet: async () => undefined,
   agentKeyFromPrivatePem: () => "k",
   withdraw: async () => ({ updateId: "u" }),
-  questFund: async () => ({ ok: true }),
-  makePayingFetch: async () => async () => {
+  makePayingFetchForWallet: async () => async () => {
     // Settles a real payment, then the merchant answers 402 again and the
     // client gives up: money moved, the call throws.
-    balance.cc -= 5;
-    throw new Error("payment required after 4 attempts");
-  },
-  makePayingFetchForWallet: async () => async () => {
     balance.cc -= 5;
     throw new Error("payment required after 4 attempts");
   },

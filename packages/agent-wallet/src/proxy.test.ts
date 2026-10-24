@@ -45,10 +45,10 @@ describe("resolveProxyUrl", () => {
 
 describe("redactProxyUrl", () => {
   it("masks user:pass credentials", () => {
-    const out = redactProxyUrl("http://EUWE8SF9:X0UZ0BZ4@212.134.67.44:40593");
-    expect(out).not.toContain("X0UZ0BZ4");
-    expect(out).not.toContain("EUWE8SF9");
-    expect(out).toContain("212.134.67.44:40593");
+    const out = redactProxyUrl("http://proxyuser:proxypass@203.0.113.7:40593");
+    expect(out).not.toContain("proxypass");
+    expect(out).not.toContain("proxyuser");
+    expect(out).toContain("203.0.113.7:40593");
   });
 
   it("leaves a credential-free URL intact", () => {

@@ -27,6 +27,7 @@ const B64 = readFileSync(
 const PARTY =
   "agent::122090a6c2579860921db36f24890b137a3a0e4875a0446687ff449cd29f3ad33106";
 const EXPIRES = "2026-11-10T00:00:00Z";
+const DSO = "DSO::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc";
 
 /**
  * Overwrite the Nth occurrence of the merchant party with an equal-length
@@ -63,40 +64,40 @@ const EVIL =
 
 describe("assertPreparedSelfPreapproval — the real MainNet argument", () => {
   it("accepts the honest capture", () => {
-    expect(() => assertPreparedSelfPreapproval(B64, PARTY, EXPIRES)).not.toThrow();
+    expect(() => assertPreparedSelfPreapproval(B64, { party: PARTY, dso: DSO, expectedExpiresAt: EXPIRES })).not.toThrow();
   });
 
   it("accepts it without an expiresAt expectation (the pre-existing call shape)", () => {
-    expect(() => assertPreparedSelfPreapproval(B64, PARTY)).not.toThrow();
+    expect(() => assertPreparedSelfPreapproval(B64, { party: PARTY, dso: DSO })).not.toThrow();
   });
 
   it("refuses when receiver names somebody else", () => {
     expect(EVIL.length).toBe(PARTY.length);
     expect(() =>
-      assertPreparedSelfPreapproval(swapParty(B64, RECEIVER_OCCURRENCE, EVIL), PARTY)
+      assertPreparedSelfPreapproval(swapParty(B64, RECEIVER_OCCURRENCE, EVIL), { party: PARTY, dso: DSO })
     ).toThrow(/receiver/);
   });
 
   it("refuses when provider names somebody else", () => {
     expect(() =>
-      assertPreparedSelfPreapproval(swapParty(B64, PROVIDER_OCCURRENCE, EVIL), PARTY)
+      assertPreparedSelfPreapproval(swapParty(B64, PROVIDER_OCCURRENCE, EVIL), { party: PARTY, dso: DSO })
     ).toThrow(/provider/);
   });
 
   it("refuses a horizon that differs from the one the relay stated", () => {
     expect(() =>
-      assertPreparedSelfPreapproval(B64, PARTY, "2036-11-10T00:00:00Z")
+      assertPreparedSelfPreapproval(B64, { party: PARTY, dso: DSO, expectedExpiresAt: "2036-11-10T00:00:00Z" })
     ).toThrow(/expiresAt/);
   });
 
   it("refuses an unparseable stated horizon rather than skipping the check", () => {
-    expect(() => assertPreparedSelfPreapproval(B64, PARTY, "whenever")).toThrow(
+    expect(() => assertPreparedSelfPreapproval(B64, { party: PARTY, dso: DSO, expectedExpiresAt: "whenever" })).toThrow(
       /not a parseable timestamp/
     );
   });
 
   it("still enforces the party it was already enforcing", () => {
-    expect(() => assertPreparedSelfPreapproval(B64, "someone-else::1220aa")).toThrow(
+    expect(() => assertPreparedSelfPreapproval(B64, { party: "someone-else::1220aa", dso: DSO })).toThrow(
       PreparedTransferMismatchError
     );
   });

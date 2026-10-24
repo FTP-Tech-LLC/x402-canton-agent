@@ -291,3 +291,34 @@ describe("makePayingFetch (402 → pay → retry)", () => {
     expect(relayCalled).toBe(false);
   });
 });
+
+describe("makePayingFetch pays through the relay it is given", () => {
+  it("uses opts.relayUrl for an EXISTING wallet, and leaves wallet.json untouched", async () => {
+    const relayHosts = new Set<string>();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: { headers?: HeadersInit; body?: string } = {}) => {
+        if (url.includes("/v1/wallet/")) {
+          relayHosts.add(new URL(url).origin);
+          if (url.endsWith("/pay/prepare")) {
+            const b = JSON.parse(init.body!);
+            const pt = preparedTransfer(b.receiver, b.amount);
+            return new Response(JSON.stringify({
+              preparedTransaction: pt, txHash: RECOMPUTE(pt), executeBefore: "2026-01-01T00:00:00Z",
+              sender: PARTY, receiver: b.receiver, amount: b.amount, instrumentId: { admin: DSO, id: "Amulet" },
+            }), { status: 200 });
+          }
+          return new Response("nf", { status: 404 });
+        }
+        const headers = new Headers(init.headers);
+        if (headers.has("payment-signature")) return new Response("{}", { status: 200 });
+        return new Response("payment required", { status: 402, headers: { "payment-required": challenge() } });
+      })
+    );
+    const f = await makePayingFetch({ relayUrl: "http://new-relay", network: "canton:testnet", hashBinding: { recomputeHash: RECOMPUTE } });
+    expect((await f(RESOURCE)).status).toBe(200);
+    expect([...relayHosts]).toEqual(["http://new-relay"]);
+    const { loadWallet } = await import("./store.js");
+    expect(loadWallet()!.relayUrl).toBe("http://relay");
+  });
+});

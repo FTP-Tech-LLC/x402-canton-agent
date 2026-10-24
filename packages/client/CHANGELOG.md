@@ -1,5 +1,31 @@
 # @ftptech/x402-canton-client
 
+## 1.2.2
+
+### Patch Changes
+
+- Updated dependencies [7fa848e]
+- Updated dependencies [068b32d]
+  - @ftptech/x402-canton-ledger@0.6.0
+  - @ftptech/x402-canton-core@1.4.0
+
+## 1.2.1
+
+### Patch Changes
+
+- Updated dependencies [d9cd495]
+  - @ftptech/x402-canton-ledger@0.5.0
+  - @ftptech/x402-canton-core@1.3.0
+
+## 1.2.0
+
+### Minor Changes
+
+- ecca81b: `peekChosenRequirement(response, signer, options)` returns the accepts[] entry
+  `wrapFetchWithCantonPayment` would pay for a 402, without paying (payee, atomic
+  amount, instrument). `peekChosenTransferMethod` is now that entry's
+  `assetTransferMethod`, so the two cannot select differently.
+
 ## 1.1.0
 
 ### Minor Changes

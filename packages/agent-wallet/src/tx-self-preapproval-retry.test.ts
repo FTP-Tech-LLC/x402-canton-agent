@@ -6,6 +6,7 @@ const wallet = {
   party: "agent::1220aa",
   privateKeyPkcs8Pem: "x",
   publicKeyFingerprint: "1220bb",
+  network: "canton:mainnet",
 } as never;
 
 describe("selfProvisionPreapproval stale-input retry", () => {

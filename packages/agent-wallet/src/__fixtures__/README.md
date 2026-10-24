@@ -50,3 +50,54 @@ real wire). Measured here: labels ARE present, the record is `Value.record`
 (field 14), and the declaration order is
 `[0] context [1] inputs [2] receiver:Party [3] provider:Party
 [4] expiresAt:Time [5] expectedDso:Optional Party`.
+
+## `mainnet-self-preapproval-create-with-fee.b64`
+
+Taken 2026-10-04 from the live relay's `POST /v1/wallet/preapproval/self/prepare`
+for party `merchant-ctai::12200333…` with `expiresAt=2027-04-01T00:00:00Z`.
+Never signed, never submitted — inert. Unlike the capture above, the merchant
+pays the fee from its own Amulet, so the tree shows the honest fee path: root
+`AmuletRules_CreateTransferPreapproval` on `Splice.AmuletRules:AmuletRules`;
+consequences `Archive` on `Splice.Amulet:Amulet`, `EventLog_HoldingsChange` on
+`Splice.AmuletRules:AmuletRules`, `OpenMiningRound_Fetch` on
+`Splice.Round:OpenMiningRound`; creates `Splice.Amulet:Amulet` (change ×2),
+`Splice.Amulet:ValidatorRewardCoupon`, `Splice.AmuletRules:TransferPreapproval`;
+plus fetches. The only parties anywhere: the merchant and the DSO.
+
+## `mainnet-cbtc-registry-offer-beneficiary2.b64`
+
+Captured 2026-10-16 from the live relay's `POST /v1/wallet/pay/prepare`:
+0.0000001 CBTC from `agent::12200c7b…` to the Tradecraft pool
+`tc-swp_CBTC-CC::1220…` (registry two-step offer shape). Never signed. Its
+`InstrumentConfiguration` input contract (created 2026-10-14T11:27:08Z, signed
+by `cbtc-network`) names the reward beneficiary `cbtc-beneficiary-2::122099b6…`,
+which replaced `cbtc-beneficiary`. Main as of 2.3.1 refuses it as an unexpected
+party; the registrar-configuration rule admits it. preparationTime
+1792132332764201µs.
+
+## `mainnet-tc-*.b64` — Tradecraft queued mode
+
+Captured 2026-10-17 through a relay's generic `POST /v1/wallet/submit/prepare`
+for the test agent `agent::12203c17…` (node 2) on pool `TC CBTC/CC LP`
+(Tradecraft DAR 1.3.12; venue `CantonSwap::122096fe…`, vault
+`cs-vault::1220b4cd…`). Unlike the captures above these were SIGNED AND
+EXECUTED (except the funded CBTC allocation, prepared only); the bytes
+authorize nothing further. The round trip they belong to: 30 CC in, batcher,
+20 CC allocation, empty CBTC allocation, 2×6 CC orders filled within ~30 s for
+0.0000151825 CBTC, both allocations withdrawn back to the wallet.
+
+| file | root | creates | preparationTime (µs) |
+|---|---|---|---|
+| `mainnet-tc-create-batcher.b64` | `AMMRules_CreateSwapOrderBatcher` | `SwapOrderBatcher` | 1792242259548689 |
+| `mainnet-tc-allocation-cc-funded.b64` | `AMMRules_CreateSettlementAllocation` (20 CC) | `AmuletAllocationV2`, `LockedAmulet`, change `Amulet` | 1792243023798011 |
+| `mainnet-tc-allocation-cbtc-empty.b64` | `AMMRules_CreateSettlementAllocation` (no funding) | registry `AllocationV2` | 1792243108208720 |
+| `mainnet-tc-allocation-cbtc-funded.b64` | `AMMRules_CreateSettlementAllocation` (0.000015 CBTC) | registry `AllocationV2`, locked + change `Holding` | 1792243595921304 |
+| `mainnet-tc-orders-2.b64` | `SwapOrderBatcher_CreateOrdersV2` (2×6 CC, minOut 0.0000072118) | 2× `SwapOrder` | 1792243120072657 |
+| `mainnet-tc-withdrawal-request-cc.b64` | (create) | `SettlementWithdrawalRequest` (CC) | 1792243400682338 |
+| `mainnet-tc-cancel-order.b64` | `SwapOrder_WithdrawV3` on a pending order (no consequences; the trailing `settlementHelpers = None` is dropped by normalization) | — | 1792254314557232 |
+| `mainnet-tc-fund-cc.b64` (prepared only) | `AMMRules_FundSettlementAllocation` (+6 CC into the empty CC allocation on `TC CC/USDCx LP`) | 2× `AmuletAllocationV2` (temporary + successor), 2× `LockedAmulet`, change `Amulet` | 1792248875467357 |
+| `mainnet-tc-fund-cbtc.b64` (prepared only) | `AMMRules_FundSettlementAllocation` (+0.000015 CBTC into the empty CBTC allocation) | 2× registry `AllocationV2`, 3× `Holding`; consequences include `TransferRule_SettleAllocationV2` | 1792248905207381 |
+
+Every record is fully labelled in Daml declaration order (matches the DAR).
+The Tradecraft choices read the ledger time, so `max_ledger_effective_time`
+equals `preparationTime` on all of them.

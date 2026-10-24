@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/canton-x402-mcp",
   "private": false,
-  "version": "1.1.0",
+  "version": "2.3.0",
   "description": "MCP server exposing a self-custody Canton x402 agent wallet as tools. A human connects it out-of-band (claude mcp add); read tools auto-allow, pay/withdraw are ask/cap. Thin wrapper over @ftptech/canton-agent-wallet.",
   "license": "Apache-2.0",
   "author": "FTP team",

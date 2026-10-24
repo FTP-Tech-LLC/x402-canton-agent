@@ -1,23 +1,17 @@
 /**
  * Per-wallet payment lock.
  *
- * v1 payments are nonce-serialized ON-LEDGER per sender: two payments from one
- * wallet signed against the same TransferCommandCounter value can never both
- * settle — the second is a doomed Send the facilitator refuses, and the client
- * must re-sign (a fresh ~$0.40 TransferCommand Create) and try again. So
- * CONCURRENT pays from the same wallet (parallel `canton-agent-wallet pay`
- * processes, or parallel calls through one makePayingFetch) only ever race each
- * other, burning Creates and losing rounds until the retry budget runs out.
+ * Serializes payments from one wallet when the paying fetch cannot tell which
+ * transfer method a 402 asks for (see makePayingFetchForWallet: a recognised
+ * transfer-factory payment is no-nonce and skips the lock). It was built for the
+ * retired nonce-serialized method, where two concurrent pays from one wallet
+ * could never both settle; it stays as the fail-safe for a challenge it cannot
+ * classify.
  *
- * The cure is to serialize at the source: one payment dance per wallet at a
- * time. The wallet identity IS its home directory (wallet.json), so the lock is
- * a directory-based mutex in that same home — `mkdir` is atomic on every
+ * The wallet identity IS its home directory (wallet.json), so the lock is a
+ * directory-based mutex in that same home — `mkdir` is atomic on every
  * platform/filesystem we care about, works ACROSS PROCESSES, and needs no
  * dependencies. A crashed holder is reclaimed via mtime staleness.
- *
- * Used by makePayingFetch only AFTER a request actually challenges with 402
- * (probe first, lock second) so unpaid traffic through the wrapped fetch never
- * queues behind a slow payment.
  */
 import { mkdirSync, rmdirSync, statSync, utimesSync } from "node:fs";
 import { join } from "node:path";
