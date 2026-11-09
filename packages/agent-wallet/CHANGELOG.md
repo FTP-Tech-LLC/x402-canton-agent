@@ -1,5 +1,18 @@
 # @ftptech/canton-agent-wallet
 
+## 2.8.1
+
+### Patch Changes
+
+- A plain token withdraw the relay prepared as a pending offer (the receiver
+  holds no TransferPreapproval for the token) is refused with
+  `RegistryOfferRefusedError`, which says so and that nothing was signed. It is
+  used only when the same bytes pass the offer-shape check; every other refusal
+  keeps its own error.
+- Uses `@ftptech/x402-canton-core` 1.9.1: a swap's pending offer must carry the
+  root transfer's terms.
+- `engines.node` is `>=20.18.1`, what its `undici` 7 dependency needs.
+
 ## 2.8.0
 
 ### Minor Changes

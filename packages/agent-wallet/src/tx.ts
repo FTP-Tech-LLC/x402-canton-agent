@@ -105,7 +105,14 @@ function rid(prefix: string): string {
  * agent to blind-sign.
  */
 type VerifySpec =
-  | { kind: "cip56"; expect: PreparedTransferExpectation }
+  | {
+      kind: "cip56";
+      expect: PreparedTransferExpectation;
+      /** A registry-token transfer that did not opt into the offer shape (a
+       *  plain withdraw): a refusal is re-checked as an offer, see
+       *  RegistryOfferRefusedError. */
+      registryOfferExplainable?: boolean;
+    }
   | { kind: "accept"; expect: PreparedAcceptExpectation }
   | { kind: "withdraw"; expect: PreparedWithdrawExpectation }
   | TradecraftVerifySpec;
@@ -173,7 +180,13 @@ async function prepareSignExecute(
   // that reaches signHashB64 ungated.
   switch (verify.kind) {
     case "cip56":
-      assertPreparedTransferMatches(preparedTransaction, verify.expect);
+      try {
+        assertPreparedTransferMatches(preparedTransaction, verify.expect);
+      } catch (e) {
+        throw verify.registryOfferExplainable === true
+          ? classifyRegistryOfferRefusal(e, preparedTransaction, verify.expect)
+          : e;
+      }
       break;
     case "accept":
       // claim path: structurally prove the prepared tx is a single inbound
@@ -257,6 +270,53 @@ export function executeTradecraftCommand(
   synchronizerId?: string
 ): Promise<string> {
   return prepareSignExecute(relay, wallet, commands, disclosedContracts, verify, hashBinding, synchronizerId);
+}
+
+/**
+ * A registry-token transfer the relay prepared as a pending offer although the
+ * caller did not opt into that shape (a plain withdraw). Thrown before signing,
+ * and only when the same bytes pass the offer-shape check, whose root names the
+ * intended sender, receiver, amount, inputs and instrument: the shape a receiver
+ * without a TransferPreapproval for the token gets. Bytes that fail that check
+ * too keep their original refusal: it may be evidence about the relay. `cause`
+ * holds the strict refusal.
+ */
+export class RegistryOfferRefusedError extends PreparedTransferMismatchError {
+  readonly receiver: string;
+  readonly instrumentId: string;
+  readonly instrumentAdmin: string | undefined;
+  constructor(receiver: string, instrumentId: string, instrumentAdmin: string | undefined, cause: unknown) {
+    super(
+      `the relay prepared this ${instrumentId} transfer to ${receiver} as a pending offer, the shape a ` +
+        `receiver without a ${instrumentId} TransferPreapproval gets. This transfer goes only as a direct ` +
+        `transfer, so nothing was signed. If the receiver has no ${instrumentId} TransferPreapproval, it ` +
+        `needs one` +
+        (instrumentAdmin !== undefined
+          ? ` (with canton-agent-wallet: preapproval --admin ${instrumentAdmin} --id ${instrumentId})`
+          : "")
+    );
+    this.name = "RegistryOfferRefusedError";
+    this.receiver = receiver;
+    this.instrumentId = instrumentId;
+    this.instrumentAdmin = instrumentAdmin;
+    Object.defineProperty(this, "cause", { value: cause, enumerable: false, writable: true, configurable: true });
+  }
+}
+
+/** Pure: re-runs the verifier on the same bytes with the offer shape admitted.
+ *  See RegistryOfferRefusedError. */
+function classifyRegistryOfferRefusal(
+  e: unknown,
+  preparedTransaction: string,
+  expect: PreparedTransferExpectation
+): unknown {
+  if (!(e instanceof PreparedTransferMismatchError) || expect.allowRegistryOffer === true) return e;
+  try {
+    assertPreparedTransferMatches(preparedTransaction, { ...expect, allowRegistryOffer: true });
+  } catch {
+    return e;
+  }
+  return new RegistryOfferRefusedError(expect.receiver, expect.instrumentId, expect.instrumentAdmin, e);
 }
 
 /**
@@ -391,6 +451,9 @@ export async function transfer(
     f.disclosedContracts,
     {
       kind: "cip56",
+      ...(opts.registryInstrument === true && opts.allowRegistryOffer !== true
+        ? { registryOfferExplainable: true }
+        : {}),
       expect: {
         // Trust anchors are CALLER INTENT only — never the relay's resolve response:
         sender: wallet.party,

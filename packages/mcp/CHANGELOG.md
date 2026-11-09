@@ -1,5 +1,12 @@
 # @ftptech/canton-x402-mcp
 
+## 2.7.1
+
+### Patch Changes
+
+- Uses `@ftptech/canton-agent-wallet` 2.8.1.
+- `engines.node` is `>=20.18.1` (was `>=18`), what `undici` 7 needs.
+
 ## 2.7.0
 
 ### Minor Changes

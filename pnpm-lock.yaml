@@ -36,8 +36,8 @@ importers:
         specifier: workspace:^
         version: link:../client
       '@ftptech/x402-canton-core':
-        specifier: ^1.9.0
-        version: 1.9.0
+        specifier: ^1.9.1
+        version: 1.9.1
       '@ftptech/x402-canton-ledger':
         specifier: ^0.6.5
         version: 0.6.5
@@ -48,8 +48,8 @@ importers:
   packages/client:
     dependencies:
       '@ftptech/x402-canton-core':
-        specifier: ^1.9.0
-        version: 1.9.0
+        specifier: ^1.9.1
+        version: 1.9.1
       '@ftptech/x402-canton-ledger':
         specifier: ^0.6.5
         version: 0.6.5
@@ -60,8 +60,8 @@ importers:
         specifier: workspace:^
         version: link:../agent-wallet
       '@ftptech/x402-canton-core':
-        specifier: ^1.9.0
-        version: 1.9.0
+        specifier: ^1.9.1
+        version: 1.9.1
       '@modelcontextprotocol/sdk':
         specifier: ^1.32.2
         version: 1.32.2(zod@3.25.76)
@@ -253,8 +253,8 @@ packages:
     resolution: {integrity: sha512-43/qtrDUokr7LJqoF2c3+RInu/t4zfrpYdoSDfYyhg52rwLV6TnOvdG4fXm7IkSB3wErkcmJS9iEhjVtOSEjjA==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
 
-  '@ftptech/x402-canton-core@1.9.0':
-    resolution: {integrity: sha512-oI9N0yumd6HaJ5sMuO5NllbKW2oyJ9ZlyPcixujtWuHl0D9GrUPqwFWo4OtCVfrot10dYT+CJSE+pzNcI+HbXA==}
+  '@ftptech/x402-canton-core@1.9.1':
+    resolution: {integrity: sha512-j4AZmaNwm0I43kLOEWZVVy2B2CoAjRdnAy7rrr/Ex+qDR8dmKMY9AurXPcq/q02+OODxwQUEdpEiLkpJ/AwUIg==}
 
   '@ftptech/x402-canton-ledger@0.6.5':
     resolution: {integrity: sha512-yqL2ZS2wvAd+/6QmFQvsMTDwc8cOI21UUJ+pzGkiUOUb0m8tQ6SraGHWDxLPBvgheMJOA7aRhyObQuPZcGVUGA==}
@@ -1507,7 +1507,7 @@ snapshots:
       '@eslint/core': 0.17.0
       levn: 0.4.1
 
-  '@ftptech/x402-canton-core@1.9.0': {}
+  '@ftptech/x402-canton-core@1.9.1': {}
 
   '@ftptech/x402-canton-ledger@0.6.5':
     dependencies:

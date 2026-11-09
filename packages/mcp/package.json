@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/canton-x402-mcp",
   "private": false,
-  "version": "2.7.0",
+  "version": "2.7.1",
   "description": "MCP server that gives an AI agent a self-custody Canton x402 wallet with spend limits set by its owner.",
   "license": "Apache-2.0",
   "author": "FTP team",
@@ -23,11 +23,11 @@
     "lint": "eslint src --max-warnings 0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=20.18.1"
   },
   "dependencies": {
     "@ftptech/canton-agent-wallet": "workspace:^",
-    "@ftptech/x402-canton-core": "^1.9.0",
+    "@ftptech/x402-canton-core": "^1.9.1",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^3.25.76"
   },
