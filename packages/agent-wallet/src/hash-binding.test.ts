@@ -1,6 +1,17 @@
 import { describe, it, expect } from "vitest";
 import { resolveHashBinding, TRUST_RELAY_HASH_ENV } from "./hash-binding.js";
 import { recomputeHash } from "./canton-hash.js";
+import { assertHashBinding } from "./verify-prepared.js";
+import { exerciseChildren, mutated } from "../../ledger/src/_graph-fixture.js";
+
+describe("a relay graph the hasher cannot walk is refused, not signed", () => {
+  it("refuses a root that is its own child with the default binding", async () => {
+    const cyclic = mutated((p) => exerciseChildren(p, "0").push("0"));
+    await expect(
+      assertHashBinding(cyclic, Buffer.alloc(32, 7).toString("base64"), resolveHashBinding({}))
+    ).rejects.toThrow(/could not recompute the prepared-transaction hash.*reached twice/);
+  });
+});
 
 describe("resolveHashBinding (real binding by default; explicit escape hatch)", () => {
   it("defaults to the REAL conformant recompute binding when the env var is unset", () => {

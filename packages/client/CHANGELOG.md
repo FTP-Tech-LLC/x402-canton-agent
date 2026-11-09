@@ -1,5 +1,36 @@
 # @ftptech/x402-canton-client
 
+## 1.4.0
+
+### Minor Changes
+
+- 2740103: A 5xx to the paid request is re-sent with the same PAYMENT-SIGNATURE up to `paidResends` times (default 2, `0` turns it off), 3 s and then 6 s apart (`paymentRetryBaseMs`). If the merchant still fails, the client throws `PAYMENT_UNCONFIRMED` instead of returning the 5xx: the payment may have settled and must not be paid again. A 402 to a re-sent payment is `PAYMENT_UNCONFIRMED` too. It never signs a second payment.
+
+### Patch Changes
+
+- 1f6a003: A `Request` passed to the paying fetch is paid as sent: the paid retry keeps the Request's headers and sends its body again. It used to drop the headers, Authorization included, and could sign a payment and then fail to send a POST body the first request had read.
+- db1d351: The express and next middlewares understand the facilitator's scheme answers. A repeat of a settled payment, refused with its `updateId`, is served through the redeemed store: once, or again after a failed delivery gave the payment back. `settlement_pending`, as a 503 with its body or a 200, is retried with the same payment for about 7 s, then answered 502 "do NOT pay again", never 402. The client reads the reason from PAYMENT-RESPONSE on a 402, where a server on the official x402 SDK puts it, and stops without paying again on `settlement_pending`. A failed SettleResponse in core carries `transaction`, `network` and `payer`.
+- Updated dependencies [d418335]
+- Updated dependencies [db1d351]
+- Updated dependencies [fb41063]
+- Updated dependencies [672bf45]
+- Updated dependencies [cddefd2]
+- Updated dependencies [7f6f15b]
+  - @ftptech/x402-canton-ledger@0.6.5
+  - @ftptech/x402-canton-core@1.9.0
+
+## 1.3.0
+
+### Minor Changes
+
+- 075bf5a: A 402 after a signed payment never re-pays, so maxPaymentRetries now only retries a network error while building the payment.
+
+### Patch Changes
+
+- 6530aec: A paid request that fails in transit now throws X402PaymentError PAYMENT_UNCONFIRMED with the network error as cause, and so does a redirected paid request that ends in a 402 or an edge header rejection. A paid 402 whose reason says the payment may already have moved (`unexpected_canton_ledger_error`, `payment_already_redeemed`, `invalid_exact_canton_payment_already_settled`) is PAYMENT_UNCONFIRMED too.
+- Updated dependencies [580bff2]
+  - @ftptech/x402-canton-core@1.5.0
+
 ## 1.2.2
 
 ### Patch Changes

@@ -1,3 +1,5 @@
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   RelayClient,
@@ -5,6 +7,8 @@ import {
   isHoldingsExceedNodeLimitError,
   PAY_AND_CLAIM_RELAY_ROUTES,
   RelayTimeoutError,
+  RelayOutcomeUnknownError,
+  isOutcomeUnknownError,
   DEFAULT_RELAY_TIMEOUT_MS,
 } from "./relay-client.js";
 
@@ -417,3 +421,194 @@ describe("RelayClient — request timeout", () => {
     expect((new RelayClient({ relayUrl: "http://r" }) as unknown as { timeoutMs: number }).timeoutMs).toBe(DEFAULT_RELAY_TIMEOUT_MS);
   });
 });
+
+describe("RelayClient: dropped connection on a submission", () => {
+  const drop = () =>
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed", { cause: new Error("other side closed") });
+      })
+    );
+
+  it("a reset after the relay read the signed execute is outcome-unknown, not 'unreachable'", async () => {
+    // Real socket: the relay reads the whole body, then the connection dies.
+    let received = false;
+    const srv = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        received = true;
+        res.socket?.destroy();
+      });
+    });
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    try {
+      const { port } = srv.address() as AddressInfo;
+      const err = await new RelayClient({ relayUrl: `http://127.0.0.1:${port}` })
+        .submitExecute({ submissionId: "s" })
+        .catch((e: unknown) => e);
+      expect(received).toBe(true);
+      expect(err).toBeInstanceOf(RelayOutcomeUnknownError);
+      expect((err as RelayOutcomeUnknownError).outcomeUnknown).toBe(true);
+      expect((err as Error).message).toMatch(/may still commit.*balance/);
+      expect(isOutcomeUnknownError(err)).toBe(true);
+    } finally {
+      await new Promise<void>((r) => srv.close(() => r()));
+    }
+  });
+
+  it("every submitting route maps a transport error to outcome-unknown", async () => {
+    drop();
+    const c = new RelayClient({ relayUrl: "http://relay" });
+    const calls: Array<Promise<unknown>> = [
+      c.submitExecute({}),
+      c.preapprovalSelfCommit({} as never),
+      c.createPreapproval("m::1", { operatorToken: "t" }),
+    ];
+    for (const p of calls) {
+      const err = await p.catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RelayOutcomeUnknownError);
+      expect((err as Error).message).toMatch(/connection failed \(other side closed\)/);
+    }
+  });
+
+  it("a connection that never opened sent nothing, so the raw error stays", async () => {
+    // Real refusal on loopback: bind a port, free it, then connect to it.
+    const srv = createServer();
+    await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+    const { port } = srv.address() as AddressInfo;
+    await new Promise<void>((r) => srv.close(() => r()));
+    const err = await new RelayClient({ relayUrl: `http://127.0.0.1:${port}` })
+      .submitExecute({})
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TypeError);
+    expect(isOutcomeUnknownError(err)).toBe(false);
+  });
+
+  it("ECONNREFUSED or a DNS failure on any submitting route keeps the raw error", async () => {
+    for (const code of ["ECONNREFUSED", "ENOTFOUND"]) {
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async () => {
+          throw new TypeError("fetch failed", { cause: Object.assign(new Error(code), { code }) });
+        })
+      );
+      const c = new RelayClient({ relayUrl: "http://relay" });
+      const calls: Array<Promise<unknown>> = [
+        c.submitExecute({}),
+        c.preapprovalSelfCommit({} as never),
+        c.createPreapproval("m::1", { operatorToken: "t" }),
+      ];
+      for (const err of await Promise.all(calls.map((p) => p.catch((e: unknown) => e)))) {
+        expect(err, code).toBeInstanceOf(TypeError);
+        expect(isOutcomeUnknownError(err), code).toBe(false);
+      }
+    }
+  });
+
+  it("onboarding is not a submission: a dropped finalize keeps the raw error", async () => {
+    // No wallet is saved before finalize, so `balance` cannot answer; a re-run makes a new party.
+    drop();
+    const err = await new RelayClient({ relayUrl: "http://relay" })
+      .onboardFinalize({} as never)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TypeError);
+    expect(isOutcomeUnknownError(err)).toBe(false);
+  });
+
+  it("a failure while reading the answer is outcome-unknown too", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        text: () => Promise.reject(new TypeError("terminated")),
+      }))
+    );
+    const err = await new RelayClient({ relayUrl: "http://relay" }).submitExecute({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayOutcomeUnknownError);
+  });
+
+  it("a read that cannot connect still surfaces the raw transport error", async () => {
+    // DISCRIMINATOR: nothing was submitted, so the reachability hint still applies.
+    drop();
+    const err = await new RelayClient({ relayUrl: "http://relay" }).balance("agent::1").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(TypeError);
+    expect(isOutcomeUnknownError(err)).toBe(false);
+  });
+
+  it("isOutcomeUnknownError follows wrapping and ignores a read timeout", () => {
+    const inner = new RelayTimeoutError("POST", "/v1/wallet/submit/execute", 1000, true);
+    expect(isOutcomeUnknownError(new Error("withdraw failed", { cause: inner }))).toBe(true);
+    expect(isOutcomeUnknownError(new RelayTimeoutError("GET", "/v1/wallet/p/balance", 1000, false))).toBe(false);
+    expect(isOutcomeUnknownError(new Error("fetch failed"))).toBe(false);
+  });
+});
+
+describe("RelayClient: an HTTP error on a submission", () => {
+  it("a 5xx on execute is outcome-unknown: the relay's own hop may have delivered it", async () => {
+    const cases = [
+      [
+        502,
+        '{"error":"wallet relay submit/execute failed","detail":"POST /v2/interactive-submission/execute failed: fetch failed"}',
+      ],
+      [502, ""],
+      [503, '{"error":"submission_outcome_unknown","where":"submit/execute","submissionId":"s"}'],
+    ] as const;
+    for (const [status, body] of cases) {
+      captureFetch(() => new Response(body, { status }));
+      const err = await new RelayClient({ relayUrl: "http://relay" }).submitExecute({}).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RelayHttpError);
+      expect((err as RelayHttpError).status).toBe(status);
+      expect(isOutcomeUnknownError(err)).toBe(true);
+      expect((err as Error).message).toMatch(/may still commit.*balance/);
+    }
+  });
+
+  it("a 5xx carrying the participant's rejection verdict is final: nothing moved, safe to rerun (MainNet, 2026-11-04)", async () => {
+    const body =
+      '{"error":"wallet relay submit/execute failed","detail":"interactive submission rejected: LOCAL_VERDICT_INACTIVE_CONTRACTS(11,cd765421): Rejected transaction is referring to inactive contracts "}';
+    captureFetch(() => new Response(body, { status: 502 }));
+    const err = await new RelayClient({ relayUrl: "http://relay" }).submitExecute({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayHttpError);
+    expect(isOutcomeUnknownError(err)).toBe(false);
+    expect((err as Error).message).not.toMatch(/may still commit/);
+    expect((err as Error).message).toContain(
+      "the participant rejected the transaction (LOCAL_VERDICT_INACTIVE_CONTRACTS): a contract it spends changed meanwhile. This transaction did not commit and charged nothing."
+    );
+  });
+
+  it("a 4xx on execute stays a plain refusal", async () => {
+    for (const status of [400, 409, 429]) {
+      captureFetch(() => new Response(JSON.stringify({ error: "refused" }), { status }));
+      const err = await new RelayClient({ relayUrl: "http://relay" }).submitExecute({}).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(RelayHttpError);
+      expect(isOutcomeUnknownError(err)).toBe(false);
+      expect((err as Error).message).not.toMatch(/may still commit/);
+    }
+  });
+
+  it("a 5xx on a route that submits nothing is unchanged", async () => {
+    captureFetch(() => new Response("fetch failed", { status: 502 }));
+    const c = new RelayClient({ relayUrl: "http://relay" });
+    const prepare = await c.submitPrepare({}).catch((e: unknown) => e);
+    expect(isOutcomeUnknownError(prepare)).toBe(false);
+    expect((prepare as Error).message).toBe("relay POST /v1/wallet/submit/prepare -> 502 fetch failed");
+    const onboard = await c.onboardFinalize({} as never).catch((e: unknown) => e);
+    expect(isOutcomeUnknownError(onboard)).toBe(false);
+    expect((onboard as Error).message).toBe("relay POST /v1/wallet/onboard/finalize -> 502 fetch failed");
+  });
+});
+
+describe("RelayClient: a refusal keeps the relay's Retry-After", () => {
+  it("parses whole seconds into retryAfterSeconds; absent or a date stays undefined", async () => {
+    captureFetch(() => new Response('{"error":"too many"}', { status: 429, headers: { "Retry-After": "60" } }));
+    const err = await new RelayClient({ relayUrl: "http://relay" }).submitExecute({}).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RelayHttpError);
+    expect((err as RelayHttpError).retryAfterSeconds).toBe(60);
+    captureFetch(() => new Response('{"error":"x"}', { status: 429, headers: { "Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT" } }));
+    const err2 = await new RelayClient({ relayUrl: "http://relay" }).submitExecute({}).catch((e: unknown) => e);
+    expect((err2 as RelayHttpError).retryAfterSeconds).toBeUndefined();
+  });
+});
+

@@ -1,4 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import {
   HEADER_PAYMENT_REQUIRED_V2,
   HEADER_PAYMENT_SIGNATURE_V2,
@@ -358,12 +360,7 @@ describe("wrapFetchWithCantonPayment", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it("stops re-paying early when a non-progressing reason repeats (does not burn doomed Creates)", async () => {
-    // Each re-pay mints a fresh TransferCommand (~$0.40 on v1). A reason a fresh
-    // payment is meant to clear in one shot but that REPEATS (here a persistent
-    // unexpected_canton_ledger_error = no funds / no preapproval) means further
-    // re-pays only burn more Creates — the loop must bail rather than spend the
-    // whole budget.
+  it("stops on the first unexpected_canton_ledger_error (the facilitator also sends it for an unknown outcome)", async () => {
     const required: X402PaymentRequired = {
       x402Version: 2,
       resource: { url: "https://example.com" },
@@ -387,10 +384,10 @@ describe("wrapFetchWithCantonPayment", () => {
     });
 
     await expect(wrapped("https://example.com")).rejects.toMatchObject({
-      code: "PAYMENT_REJECTED",
+      code: "PAYMENT_UNCONFIRMED",
     });
-    // 1 probe + 2 pays (the 2nd pay sees the SAME reason and bails) — NOT 1 + 5.
-    expect(fetch).toHaveBeenCalledTimes(3);
+    // 1 probe + 1 pay. No re-pay.
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 
   it("NEVER re-pays after an ambiguous execute outcome — one 402 is enough to stop", async () => {
@@ -400,9 +397,6 @@ describe("wrapFetchWithCantonPayment", () => {
     // may well have accepted the transaction. From here the two look identical,
     // and a re-pay re-prepares over the payer's REMAINING holdings — so if the
     // first one committed, the payer pays twice for one purchase.
-    //
-    // STOP_IF_REPEATED is the wrong tool for that: it permits exactly one
-    // re-pay before bailing, and that one re-pay IS the double payment.
     const required: X402PaymentRequired = {
       x402Version: 2,
       resource: { url: "https://example.com" },
@@ -477,71 +471,182 @@ describe("wrapFetchWithCantonPayment", () => {
     expect(resourceCalls).toBe(2);
   });
 
-  it("keeps re-paying through a repeating nonce_reuse (transient: contention / Scan lag)", async () => {
-    // Same-wallet contention and Scan lag both surface as nonce_reuse and both
-    // resolve on a later attempt (counter advances / lag clears). Stopping
-    // early here turned recoverable rapid-fire into hard failures — the loop
-    // must spend its full budget.
+  // A merchant that settles each payment and still answers 402 collects one
+  // real payment per signature. Mirrors the audit PoC: count the signatures
+  // handed to the merchant, with the default options.
+  async function payAgainst402(body: string, options = {}, headerReason?: string) {
     const required: X402PaymentRequired = {
       x402Version: 2,
+      ...(headerReason !== undefined ? { error: headerReason } : {}),
       resource: { url: "https://example.com" },
       accepts: [requirements()],
     };
     const fetch = vi.fn(
       async () =>
-        new Response(
-          JSON.stringify({ error: "invalid_exact_canton_nonce_reuse" }),
-          {
-            status: 402,
-            headers: {
-              [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required),
-            },
-          }
-        )
+        new Response(body, {
+          status: 402,
+          headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+        })
     ) as typeof globalThis.fetch;
-    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
-      maxPaymentRetries: 3,
+    const signer = fakeSigner();
+    const wrapped = wrapFetchWithCantonPayment(fetch, signer, {
       sleep: async () => {},
+      ...options,
     });
+    const err = await wrapped("https://example.com").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(X402PaymentError);
+    const signatures = (signer.signTransferFactory as ReturnType<typeof vi.fn>).mock.calls.length;
+    return { err: err as X402PaymentError, signatures };
+  }
 
-    await expect(wrapped("https://example.com")).rejects.toMatchObject({
-      code: "PAYMENT_REJECTED",
-    });
-    // Full budget spent (1 probe + 4 pays), NOT short-circuited after 2.
-    expect(fetch).toHaveBeenCalledTimes(5);
+  it("a 402 after signing never re-pays: empty body, made-up or unlisted reason", async () => {
+    for (const body of [
+      "",
+      "{}",
+      JSON.stringify({ error: "totally_made_up" }),
+      JSON.stringify({ error: "invalid_exact_canton_preapproval_missing" }),
+      JSON.stringify({ error: "invalid_exact_canton_nonce_reuse" }),
+      JSON.stringify({ error: "invalid_exact_canton_input_contention" }),
+      JSON.stringify({ error: "payment_already_redeemed" }),
+    ]) {
+      expect((await payAgainst402(body)).signatures).toBe(1);
+    }
   });
 
-  it("keeps re-paying through a repeating counter_not_ready (the dead-zone clears with time)", async () => {
-    // The first-payment dead-zone returns counter_not_ready until the SV creates
-    // the counter — a repeat is EXPECTED and a re-pay after backoff is exactly
-    // how it resolves, so this reason must NOT short-circuit the budget.
+  it("never re-pays on counter_not_ready or expired, whatever maxPaymentRetries says", async () => {
+    for (const reason of [
+      "invalid_exact_canton_counter_not_ready",
+      "invalid_exact_canton_expired",
+    ]) {
+      for (const options of [{}, { maxPaymentRetries: 0 }, { maxPaymentRetries: 10 }]) {
+        const { err, signatures } = await payAgainst402(JSON.stringify({ error: reason }), options);
+        expect(signatures).toBe(1);
+        expect(err.code).toBe("PAYMENT_REJECTED");
+        expect(err.message).toBe(
+          `payment returned 402 after it was signed (${reason}); ` +
+            `this client will not pay again for this request`
+        );
+      }
+    }
+  });
+
+  it("a reason that says the payment may already have moved is PAYMENT_UNCONFIRMED", async () => {
+    for (const reason of [
+      "invalid_exact_canton_execute_failed",
+      "unexpected_canton_ledger_error",
+      "payment_already_redeemed",
+      "invalid_exact_canton_payment_already_settled",
+    ]) {
+      for (const headerOnly of [false, true]) {
+        const { err, signatures } = headerOnly
+          ? await payAgainst402("{}", {}, reason)
+          : await payAgainst402(JSON.stringify({ error: reason }));
+        expect(signatures).toBe(1);
+        expect(err.code).toBe("PAYMENT_UNCONFIRMED");
+        expect(err.message).toContain(`(${reason})`);
+      }
+    }
+  });
+
+  // A server on the official x402 SDK answers a failed settle 402 with an
+  // empty body and the reason only in PAYMENT-RESPONSE.
+  it("reads the reason from PAYMENT-RESPONSE, and settlement_pending is PAYMENT_UNCONFIRMED", async () => {
+    for (const [reason, code] of [
+      ["settlement_pending", "PAYMENT_UNCONFIRMED"],
+      ["invalid_exact_canton_payment_already_settled", "PAYMENT_UNCONFIRMED"],
+      ["invalid_exact_canton_amount_mismatch", "PAYMENT_REJECTED"],
+    ] as const) {
+      const required: X402PaymentRequired = {
+        x402Version: 2,
+        resource: { url: "https://example.com" },
+        accepts: [requirements()],
+      };
+      let calls = 0;
+      const fetch = vi.fn(async () => {
+        calls++;
+        const headers: Record<string, string> = { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) };
+        if (calls > 1) {
+          headers[HEADER_PAYMENT_RESPONSE_V2] = encodeBase64Json({ success: false, errorReason: reason, transaction: "", network: "canton:devnet" });
+        }
+        return new Response("", { status: 402, headers: calls > 1 ? { [HEADER_PAYMENT_RESPONSE_V2]: headers[HEADER_PAYMENT_RESPONSE_V2]! } : headers });
+      }) as typeof globalThis.fetch;
+      const signer = fakeSigner();
+      const err = await wrapFetchWithCantonPayment(fetch, signer, { sleep: async () => {} })("https://example.com").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(X402PaymentError);
+      expect((err as X402PaymentError).code, reason).toBe(code);
+      expect((err as X402PaymentError).message).toContain(`(${reason})`);
+      expect((signer.signTransferFactory as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1);
+    }
+  });
+
+  // The express middleware answers a failed verify with a `{}` body and the
+  // reason only in the PAYMENT-REQUIRED header.
+  it("reads the reason from the PAYMENT-REQUIRED header when the body has none", async () => {
+    for (const body of ["", "{}"]) {
+      const { err, signatures } = await payAgainst402(body, {}, "invalid_exact_canton_expired");
+      expect(err.message).toContain("(invalid_exact_canton_expired)");
+      expect(signatures).toBe(1);
+    }
+  });
+
+  it("a header-only execute_failed is still PAYMENT_UNCONFIRMED", async () => {
     const required: X402PaymentRequired = {
       x402Version: 2,
+      error: "invalid_exact_canton_execute_failed",
       resource: { url: "https://example.com" },
       accepts: [requirements()],
     };
     const fetch = vi.fn(
       async () =>
-        new Response(
-          JSON.stringify({ error: "invalid_exact_canton_counter_not_ready" }),
-          {
-            status: 402,
-            headers: {
-              [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required),
-            },
-          }
-        )
+        new Response("{}", {
+          status: 402,
+          headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+        })
     ) as typeof globalThis.fetch;
-    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
-      maxPaymentRetries: 2,
-      sleep: async () => {},
-    });
+    const signer = fakeSigner();
+    const wrapped = wrapFetchWithCantonPayment(fetch, signer, { sleep: async () => {} });
+    const err = await wrapped("https://example.com").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(X402PaymentError);
+    expect((err as X402PaymentError).code).toBe("PAYMENT_UNCONFIRMED");
+    expect(signer.signTransferFactory).toHaveBeenCalledTimes(1);
+  });
 
-    await expect(wrapped("https://example.com")).rejects.toMatchObject({
-      code: "PAYMENT_REJECTED",
-    });
-    // Retried to the full budget (1 probe + 3 pays), NOT short-circuited.
-    expect(fetch).toHaveBeenCalledTimes(4);
+  it("the body reason wins over the header reason", async () => {
+    const rejected = await payAgainst402(
+      JSON.stringify({ error: "invalid_exact_canton_expired" }),
+      {},
+      "invalid_exact_canton_execute_failed"
+    );
+    expect(rejected.err.code).toBe("PAYMENT_REJECTED");
+    const unconfirmed = await payAgainst402(
+      JSON.stringify({ error: "invalid_exact_canton_execute_failed" }),
+      {},
+      "PAYMENT-SIGNATURE header required"
+    );
+    expect(unconfirmed.err.code).toBe("PAYMENT_UNCONFIRMED");
+  });
+
+  it("an undecodable PAYMENT-REQUIRED header on a paid 402 gives no reason and stops", async () => {
+    const required: X402PaymentRequired = {
+      x402Version: 2,
+      resource: { url: "https://example.com" },
+      accepts: [requirements()],
+    };
+    let n = 0;
+    const fetch = vi.fn(async () => {
+      n++;
+      const header = n === 1 ? paymentRequiredHeader(required) : "!!!not-base64-json!!!";
+      return new Response("{}", {
+        status: 402,
+        headers: { [HEADER_PAYMENT_REQUIRED_V2]: header },
+      });
+    }) as typeof globalThis.fetch;
+    const signer = fakeSigner();
+    const wrapped = wrapFetchWithCantonPayment(fetch, signer, { sleep: async () => {} });
+    const err = await wrapped("https://example.com").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(X402PaymentError);
+    expect((err as X402PaymentError).code).toBe("PAYMENT_REJECTED");
+    expect(signer.signTransferFactory).toHaveBeenCalledTimes(1);
   });
 
   it("requests already carrying PAYMENT-SIGNATURE bypass the payment dance", async () => {
@@ -1189,33 +1294,90 @@ describe("wrapFetchWithCantonPayment — new coverage", () => {
     expect(parsed.value).toBe(42);
   });
 
-  // ── NEW: when network changes between 402 and retry → error propagates ────
-  it("when network changes between 402 and retry (host unreachable) → error propagates", async () => {
+  it("any transport error on the paid request is PAYMENT_UNCONFIRMED with the error as cause, a refused connection too, since a followed redirect can be refused after the merchant settled", async () => {
     const required: X402PaymentRequired = {
       x402Version: 2,
       resource: { url: "https://api.example.com/unstable" },
       accepts: [requirements()],
     };
-    let callCount = 0;
-    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      callCount++;
-      if (callCount === 1) {
-        // First call returns 402 normally
+    for (const dropped of [
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("connect ECONNREFUSED"), { code: "ECONNREFUSED" }),
+      }),
+      Object.assign(new TypeError("fetch failed"), {
+        cause: Object.assign(new Error("read ECONNRESET"), { code: "ECONNRESET" }),
+      }),
+      new TypeError("fetch failed"),
+    ]) {
+      const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        if (new Headers(init?.headers).has(HEADER_PAYMENT_SIGNATURE_V2)) throw dropped;
         return new Response("{}", {
           status: 402,
           headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
         });
-      }
-      // Second call (retry after payment) — host is now unreachable
-      throw new TypeError("fetch failed: ECONNREFUSED — host unreachable");
-    }) as typeof globalThis.fetch;
+      }) as typeof globalThis.fetch;
+      const signer = fakeSigner();
+      const wrapped = wrapFetchWithCantonPayment(fetch, signer);
+      const err = await wrapped("https://api.example.com/unstable").catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(X402PaymentError);
+      expect((err as X402PaymentError).code).toBe("PAYMENT_UNCONFIRMED");
+      expect((err as X402PaymentError).cause).toBe(dropped);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(signer.signTransferFactory).toHaveBeenCalledTimes(1);
+    }
+  });
 
-    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner());
-    // The network error from the retry must propagate as-is (not swallowed)
-    await expect(wrapped("https://api.example.com/unstable")).rejects.toThrow(
-      /ECONNREFUSED/
-    );
-    expect(callCount).toBe(2);
+  function abortable402Fetch(onPaid: () => Response) {
+    const required: X402PaymentRequired = {
+      x402Version: 2,
+      resource: { url: "https://api.example.com/data" },
+      accepts: [requirements()],
+    };
+    return vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (new Headers(init?.headers).has(HEADER_PAYMENT_SIGNATURE_V2)) return onPaid();
+      return new Response("{}", {
+        status: 402,
+        headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
+      });
+    }) as typeof globalThis.fetch;
+  }
+
+  it("an abort before the paid request is sent rethrows the abort reason, and no payment reaches the merchant", async () => {
+    const ac = new AbortController();
+    const signer = fakeSigner();
+    const sign = signer.signTransferFactory!;
+    // The caller gives up while the payment is being signed.
+    const aborting: CantonSigner = {
+      party: signer.party,
+      signTransferFactory: async (input) => {
+        ac.abort();
+        return sign(input);
+      },
+    };
+    let paid = 0;
+    const fetch = abortable402Fetch(() => {
+      paid++;
+      return new Response("ok", { status: 200 });
+    });
+    const err = await wrapFetchWithCantonPayment(fetch, aborting)("https://api.example.com/data", {
+      signal: ac.signal,
+    }).catch((e: unknown) => e);
+    expect(err).toBe(ac.signal.reason);
+    expect(paid).toBe(0);
+  });
+
+  it("an abort while the paid request is in flight is PAYMENT_UNCONFIRMED, with the abort as cause", async () => {
+    const ac = new AbortController();
+    const fetch = abortable402Fetch(() => {
+      ac.abort();
+      throw ac.signal.reason;
+    });
+    const err = await wrapFetchWithCantonPayment(fetch, fakeSigner())("https://api.example.com/data", {
+      signal: ac.signal,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(X402PaymentError);
+    expect((err as X402PaymentError).code).toBe("PAYMENT_UNCONFIRMED");
+    expect((err as X402PaymentError).cause).toBe(ac.signal.reason);
   });
 
   // ── NEW: PAYMENT-REQUIRED header from 402 is base64 JSON ──────────────────
@@ -1351,18 +1513,19 @@ describe("wrapFetchWithCantonPayment — new coverage", () => {
     expect(fetch).toHaveBeenCalledTimes(2);
   });
 
-  it("re-pays with backoff and SUCCEEDS when a transient 402 clears (dead-zone / rolled amulet)", async () => {
+  it("does not re-pay through counter_not_ready, even when a second payment would be served", async () => {
     const required: X402PaymentRequired = {
       x402Version: 2,
       resource: { url: "https://api.example.com/transient" },
       accepts: [requirements()],
     };
-    // 402 (probe) -> 402 (pay attempt 0, transient) -> 200 (pay attempt 1).
+    // 402 (probe) -> 402 (the signed payment) -> 200 that a second payment would get.
     let n = 0;
     const fetch = vi.fn(async () => {
       n += 1;
       if (n <= 2) {
-        return new Response("{}", {
+        const body = n === 2 ? JSON.stringify({ error: "invalid_exact_canton_counter_not_ready" }) : "{}";
+        return new Response(body, {
           status: 402,
           headers: { [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader(required) },
         });
@@ -1378,13 +1541,12 @@ describe("wrapFetchWithCantonPayment — new coverage", () => {
       },
     });
 
-    const res = await wrapped("https://api.example.com/transient");
-    expect(res.status).toBe(200);
-    // probe + 2 pay attempts (the 2nd succeeds) = 3 fetch calls; 1 backoff slept.
-    expect(fetch).toHaveBeenCalledTimes(3);
-    expect(sleeps.length).toBe(1);
-    // re-paid from scratch -> signer invoked once per pay attempt (2).
-    expect(signer.signTransferFactory as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(2);
+    await expect(wrapped("https://api.example.com/transient")).rejects.toMatchObject({
+      code: "PAYMENT_REJECTED",
+    });
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(sleeps).toEqual([]);
+    expect(signer.signTransferFactory as ReturnType<typeof vi.fn>).toHaveBeenCalledTimes(1);
   });
 
   // ── NEW: parsePaymentRequiredHeader with valid base64 → returns array of requirements ─
@@ -1747,35 +1909,27 @@ describe("ambiguity outranks the retry budget", () => {
   });
 
   it("an ambiguous reason on the LAST attempt is not called a rejection", async () => {
-    // Retryable reasons first, then the ambiguous one exactly as the budget
-    // runs out — the interleaving the old ordering got wrong.
-    // Indexed by CALL: [0] is the unpaid probe, then one entry per paid
-    // attempt. maxPaymentRetries 2 means attempts 0,1,2 — so the ambiguous
-    // reason must land on call 3, the attempt where the budget runs out. Put
-    // it any earlier and BOTH orderings answer correctly, which is how this
-    // test first passed against the bug.
-    const byCall = [
-      "invalid_exact_canton_input_contention", // probe
-      "invalid_exact_canton_input_contention", // attempt 0
-      "invalid_exact_canton_input_contention", // attempt 1
-      AMBIGUOUS, // attempt 2 === maxRetries -> the exhausting one
-    ];
-    let i = 0;
-    const fetch = vi.fn(async () =>
-      reply(byCall[Math.min(i++, byCall.length - 1)]!)
-    ) as typeof globalThis.fetch;
-    const wrapped = wrapFetchWithCantonPayment(fetch, fakeSigner(), {
-      maxPaymentRetries: 2,
+    // A network error while building the payment spends the budget before
+    // anything is signed, so the one paid 402 lands on the last attempt.
+    const fetch = vi.fn(async () => reply(AMBIGUOUS)) as typeof globalThis.fetch;
+    const signer = fakeSigner();
+    const netErr = Object.assign(new TypeError("fetch failed"), {
+      cause: Object.assign(new Error("read ETIMEDOUT"), { code: "ETIMEDOUT" }),
+    });
+    (signer.signTransferFactory as ReturnType<typeof vi.fn>).mockRejectedValueOnce(netErr);
+    const wrapped = wrapFetchWithCantonPayment(fetch, signer, {
+      maxPaymentRetries: 1,
       sleep: async () => {},
     });
     await expect(wrapped("https://example.com")).rejects.toThrow(
       /could not confirm the payment[\s\S]*NOT pay again/i
     );
+    expect(signer.signTransferFactory).toHaveBeenCalledTimes(2);
   });
 
-  it("a NON-ambiguous reason still exhausts into the rejection message", async () => {
-    // DISCRIMINATOR: the budget branch must keep its wording for reasons that
-    // really are definite, or every failure would read as unresolved.
+  it("a NON-ambiguous reason gets the plain rejection message", async () => {
+    // DISCRIMINATOR: a definite reason must keep its own wording, or every
+    // failure would read as unresolved.
     const fetch = vi.fn(async () =>
       reply("invalid_exact_canton_amount")
     ) as typeof globalThis.fetch;
@@ -1784,7 +1938,7 @@ describe("ambiguity outranks the retry budget", () => {
       sleep: async () => {},
     });
     await expect(wrapped("https://example.com")).rejects.toThrow(
-      /facilitator rejected the payment/i
+      /payment returned 402 after it was signed \(invalid_exact_canton_amount\)/
     );
   });
 });
@@ -1833,5 +1987,73 @@ describe("the ambiguous outcome has its own machine-readable code", () => {
     await expect(wrapped("https://example.com")).rejects.toMatchObject({
       code: "PAYMENT_REJECTED",
     });
+  });
+});
+
+describe("a paid request that was redirected", () => {
+  // Real fetch on loopback: only a fetch that followed a redirect reports one.
+  // The merchant settles the paid request, then redirects it to /next.
+  const challenge = {
+    [HEADER_PAYMENT_REQUIRED_V2]: paymentRequiredHeader({
+      x402Version: 2,
+      resource: { url: "http://127.0.0.1/buy" },
+      accepts: [requirements()],
+    }),
+  };
+  const edgePages: Array<(res: http.ServerResponse) => void> = [
+    (res) => res.writeHead(431).end(),
+    (res) =>
+      res
+        .writeHead(400)
+        .end("<html><head><title>400 Request Header Or Cookie Too Large</title></head></html>"),
+  ];
+
+  async function pay(redirect: boolean, answerPaid: (res: http.ServerResponse) => void) {
+    let settled = 0;
+    const server = http.createServer((req, res) => {
+      if (!req.headers[HEADER_PAYMENT_SIGNATURE_V2.toLowerCase()]) {
+        res.writeHead(402, challenge).end("{}");
+      } else if (redirect && req.url === "/buy") {
+        settled++;
+        res.writeHead(302, { location: "/next" }).end();
+      } else {
+        answerPaid(res);
+      }
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const { port } = server.address() as AddressInfo;
+    const signer = fakeSigner();
+    try {
+      const err = await wrapFetchWithCantonPayment(globalThis.fetch, signer)(
+        `http://127.0.0.1:${port}/buy`
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(X402PaymentError);
+      expect(signer.signTransferFactory).toHaveBeenCalledTimes(1);
+      return { code: (err as X402PaymentError).code, settled };
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  }
+
+  it("a 402 after the redirect is PAYMENT_UNCONFIRMED: the merchant may have settled before redirecting", async () => {
+    expect(await pay(true, (res) => res.writeHead(402, challenge).end("{}"))).toEqual({
+      code: "PAYMENT_UNCONFIRMED",
+      settled: 1,
+    });
+  });
+
+  it("an edge header rejection after the redirect is PAYMENT_UNCONFIRMED, not MERCHANT_HEADER_LIMIT", async () => {
+    for (const edge of edgePages) {
+      expect(await pay(true, edge)).toEqual({ code: "PAYMENT_UNCONFIRMED", settled: 1 });
+    }
+  });
+
+  it("without a redirect, a paid 402 stays PAYMENT_REJECTED and an edge rejection stays MERCHANT_HEADER_LIMIT", async () => {
+    expect((await pay(false, (res) => res.writeHead(402, challenge).end("{}"))).code).toBe(
+      "PAYMENT_REJECTED"
+    );
+    for (const edge of edgePages) {
+      expect((await pay(false, edge)).code).toBe("MERCHANT_HEADER_LIMIT");
+    }
   });
 });

@@ -14,8 +14,10 @@ import { describe, it, expect } from "vitest";
 import {
   choiceArgument,
   len,
+  rootInputContract,
   str,
   vintField,
+  vNumeric,
   vParty,
   vRecord,
   type TransferOpts,
@@ -155,6 +157,8 @@ function build(o: {
   const metadata = Buffer.concat([
     len(2 /* submitter_info */, submitterInfo),
     str(3 /* synchronizer_id */, "sync::1220ffff"),
+    // The root's factory, the DSO's contract, as every capture lists it.
+    len(7 /* input_contracts */, rootInputContract({ dso: DSO })),
     ...(o.inputs ?? []).map((ic) => len(7 /* input_contracts */, ic)),
   ]);
   return Buffer.concat([len(1, damlTx), len(2, metadata)]).toString("base64");
@@ -172,7 +176,14 @@ const honestDelivery = exerciseNode({
   choiceId: "TransferPreapproval_SendV2",
   contractId: PRE_CID,
   template: "Splice.AmuletRules:TransferPreapproval",
-  chosenValue: vRecord([]),
+  // [0] context [1] inputs [2] amount [3] sender, as on the MainNet capture:
+  // the delivery must pay what the root names.
+  chosenValue: vRecord([
+    { label: "context", value: vRecord([]) },
+    { label: "inputs", value: vRecord([]) },
+    { label: "amount", value: vNumeric(OK.amount) },
+    { label: "sender", value: vParty(SENDER) },
+  ]),
 });
 
 describe("provider role exception — honest baseline", () => {

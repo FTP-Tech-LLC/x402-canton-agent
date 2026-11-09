@@ -98,6 +98,52 @@ export function signHashB64(hashB64: string, pkcs8Pem: string): string {
   ).toString("base64");
 }
 
+/** What a relay read proof is bound to, besides the signer's party. */
+export interface ReadProofParts {
+  method: string;
+  /** The host the client connects to, lowercased. */
+  host: string;
+  /** Decoded URL pathname. */
+  pathname: string;
+  /** Raw query string exactly as sent, without "?" ("" when none). */
+  query: string;
+  timestampMs: number;
+}
+
+/**
+ * A wallet's read-proof signer. It is NOT a general signing primitive: it takes
+ * the parts of a request and builds the one message the relay checks
+ * (`canton-x402 relay read v1` first, then method, host, path, query, party,
+ * timestamp; see packages/facilitator/src/routes/read-proof.ts), so it cannot
+ * be handed a transaction hash and return a signature the ledger would accept.
+ */
+export function readSignerFromWallet(wallet: {
+  party: string;
+  privateKeyPkcs8Pem: string;
+}): { party: string; sign(parts: ReadProofParts): Uint8Array } {
+  // Parsed on first use: building a signer must never throw for a wallet whose
+  // key is only needed later (or never).
+  let key: KeyObject | undefined;
+  return {
+    party: wallet.party,
+    sign: (p) => {
+      const message = Buffer.from(
+        [
+          "canton-x402 relay read v1",
+          p.method,
+          p.host.toLowerCase(),
+          p.pathname,
+          p.query,
+          wallet.party,
+          String(p.timestampMs),
+        ].join("\n"),
+        "utf8"
+      );
+      return cryptoSign(null, message, (key ??= createPrivateKey(wallet.privateKeyPkcs8Pem)));
+    },
+  };
+}
+
 /** Verify a signHashB64 result — used in tests + the sign-before-trust check. */
 export function verifyHashB64(
   hashB64: string,

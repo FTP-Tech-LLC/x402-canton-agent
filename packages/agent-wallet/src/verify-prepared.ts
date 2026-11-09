@@ -104,7 +104,7 @@
  */
 import { createHash, createPublicKey, timingSafeEqual } from "node:crypto";
 import { decodeTopologyTransaction } from "@canton-network/core-tx-visualizer";
-import type { TopologyTransaction } from "@canton-network/core-ledger-proto";
+import { TopologyTransaction } from "@canton-network/core-ledger-proto";
 
 /* Locally-used core symbols. The re-export block below is a re-export, not an
  * import, so a name needed by code IN this file has to be bound here too. */
@@ -120,6 +120,7 @@ export {
   canonicalAmount,
   assertPreparedTransferMatches,
   assertPreparedAcceptMatches,
+  assertPreparedWithdrawMatches,
   assertPreparedRegistrySelfPreapproval,
   assertPreparedTcCreateBatcher,
   assertPreparedTcCreateAllocation,
@@ -138,6 +139,7 @@ export type {
   DecodedInputContract,
   PreparedTransferExpectation,
   PreparedAcceptExpectation,
+  PreparedWithdrawExpectation,
   RegistrySelfPreapprovalExpectation,
   TradecraftParties,
   TcCreateBatcherExpectation,
@@ -356,7 +358,8 @@ export function hashMatchesPreparedPlain(
  *       asserted to bind EXACTLY the agent's key — PartyToKeyMapping threshold 1
  *       with the agent's key as the SOLE signer (no co-holder), any
  *       NamespaceDelegation targets only the agent's key over its own namespace,
- *       any PartyToParticipant is single-custody. This replaces the old
+ *       any PartyToParticipant is single-custody with no signing key but the
+ *       agent's in its party_signing_keys. This replaces the old
  *       substring-only check (which a relay could satisfy while ALSO binding an
  *       extra foreign co-signer) and closes the round-5 / convergence custody-
  *       hijack vectors. See `assertOnboardingTopologyDecodeBindsKey`.
@@ -529,7 +532,11 @@ export function assertOnboardingTopologyBindsKey(
  *     - party === the agent's party
  *     - threshold === 1 (NOT a consortium party — threshold>1 means multiple
  *       participants must co-act, a custody-sharing definition)
- *     - participants is non-empty (hosting is sane).
+ *     - participants is non-empty (hosting is sane)
+ *     - party_signing_keys (field 6) is absent, or threshold 1 with the agent's
+ *       own key as the only key. Read from the raw bytes: the typed decoder
+ *       (core-ledger-proto 1.4.0) has no field 6 and drops it silently. Any
+ *       other field we do not read is refused.
  *
  * Any mapping that references a key/namespace/party that is NOT the agent's, or
  * any threshold>1, or any extra key-holder, is rejected. Mapping types we do not
@@ -552,6 +559,160 @@ function rawPointFromSigningKey(pk: { publicKey: Uint8Array } | undefined): Buff
   return buf.subarray(buf.length - 32);
 }
 
+/* PartyToParticipant.party_signing_keys (field 6) holds the party's protocol
+ * signing keys: on MainNet that is where an external party's key lives (see
+ * topology-reader). The typed decoder does not know the field, so a relay could
+ * add its own key there unseen. The minimal reader below walks the same bytes
+ * the multiHash covers, the way Canton parses them. */
+
+interface RawField {
+  no: number;
+  wire: number;
+  /** Varint value, or the length of a length-delimited field. */
+  value: number;
+  /** Payload of a length-delimited field. */
+  bytes?: Buffer;
+}
+
+function rawDecodeError(what: string): OnboardingTopologyMismatchError {
+  return new OnboardingTopologyMismatchError(
+    `could not read a relay-returned onboarding transaction (${what}) - refusing to sign`
+  );
+}
+
+/** Decode one protobuf message. Tags and length prefixes must fit in uint32,
+ *  the same rule core's prepared-transaction reader enforces, so an over-long
+ *  encoding cannot be read differently here and by the participant. */
+function rawFields(buf: Buffer): RawField[] {
+  const out: RawField[] = [];
+  let pos = 0;
+  const varint = (): number => {
+    let value = 0;
+    for (let shift = 0; shift < 64 && pos < buf.length; shift += 7) {
+      const b = buf[pos++] as number;
+      value += (b & 0x7f) * 2 ** shift;
+      if ((b & 0x80) === 0) return value;
+    }
+    throw rawDecodeError("malformed varint");
+  };
+  while (pos < buf.length) {
+    const tag = varint();
+    const no = Math.floor(tag / 8);
+    const wire = tag % 8;
+    if (tag > 0xffffffff || no === 0) throw rawDecodeError("invalid tag");
+    if (wire === 0) {
+      out.push({ no, wire, value: varint() });
+    } else if (wire === 2) {
+      const len = varint();
+      if (len > buf.length - pos) throw rawDecodeError("field overruns buffer");
+      out.push({ no, wire, value: len, bytes: buf.subarray(pos, pos + len) });
+      pos += len;
+    } else if (wire === 1 || wire === 5) {
+      const len = wire === 1 ? 8 : 4;
+      if (len > buf.length - pos) throw rawDecodeError("field overruns buffer");
+      out.push({ no, wire, value: 0 });
+      pos += len;
+    } else {
+      throw rawDecodeError(`unsupported wire type ${wire}`);
+    }
+  }
+  return out;
+}
+
+/** The single occurrence of a non-repeated field, or undefined. A duplicate or
+ *  a wrong wire type is refused: duplicates of a message field merge on the
+ *  participant, so a second party_signing_keys could add keys we never saw. */
+function rawOnly(
+  fields: RawField[],
+  no: number,
+  wire: number,
+  what: string
+): RawField | undefined {
+  const all = fields.filter((f) => f.no === no);
+  if (all.length > 1) throw rawDecodeError(`${what} appears ${all.length} times`);
+  if (all[0] !== undefined && all[0].wire !== wire) {
+    throw rawDecodeError(`${what} has wire type ${all[0].wire}`);
+  }
+  return all[0];
+}
+
+/** One onboarding transaction's TopologyTransaction bytes, and the field number
+ *  and raw bytes of its TopologyMapping oneof member. A live participant returns
+ *  each transaction inside Canton's versioned envelope (data = 1, version = 2);
+ *  unwrap it first. */
+function rawTopologyMapping(txB64: string): { tx: Buffer; no: number; bytes: Buffer } {
+  let tx: Buffer = Buffer.from(txB64, "base64");
+  let fields = rawFields(tx);
+  // TopologyTransaction.operation (field 1) is a varint, so a length-delimited
+  // field 1 is the envelope's data.
+  if (fields.some((f) => f.no === 1 && f.wire === 2)) {
+    if (fields.some((f) => !(f.no === 1 && f.wire === 2) && !(f.no === 2 && f.wire === 0))) {
+      throw rawDecodeError("unexpected field in the versioned envelope");
+    }
+    tx = rawOnly(fields, 1, 2, "envelope data")!.bytes!;
+    fields = rawFields(tx);
+  }
+  const mapping = rawOnly(fields, 3, 2, "TopologyTransaction.mapping");
+  if (mapping === undefined) throw rawDecodeError("no mapping");
+  const members = rawFields(mapping.bytes!);
+  if (members.length !== 1 || members[0]!.wire !== 2) {
+    throw rawDecodeError("TopologyMapping must carry exactly one mapping");
+  }
+  return { tx, no: members[0]!.no, bytes: members[0]!.bytes! };
+}
+
+/** TopologyMapping.party_to_participant oneof field number. */
+const TOPOLOGY_MAPPING_PARTY_TO_PARTICIPANT = 9;
+
+/** Refuse a PartyToParticipant whose party_signing_keys is anything but absent
+ *  or {keys: [agent key], threshold: 1}, or that carries a field we do not read
+ *  (party = 1, threshold = 2, participants = 3, party_signing_keys = 6). */
+function assertPartySigningKeys(
+  p2p: Buffer,
+  isAgentKey: (pk: { publicKey: Uint8Array } | undefined) => boolean
+): void {
+  const fields = rawFields(p2p);
+  const unknown = fields.find((f) => ![1, 2, 3, 6].includes(f.no));
+  if (unknown !== undefined) {
+    throw new OnboardingTopologyMismatchError(
+      `onboarding PartyToParticipant carries unknown field ${unknown.no} - refusing to sign ` +
+        `(cannot account for what it grants)`
+    );
+  }
+  const signingKeys = rawOnly(fields, 6, 2, "party_signing_keys");
+  if (signingKeys === undefined) return;
+
+  const inner = rawFields(signingKeys.bytes!);
+  if (inner.some((f) => f.no !== 1 && f.no !== 2)) {
+    throw rawDecodeError("unknown field in party_signing_keys");
+  }
+  const keys = inner.filter((f) => f.no === 1);
+  if (keys.some((f) => f.wire !== 2)) {
+    throw rawDecodeError("party_signing_keys key has wrong wire type");
+  }
+  const threshold = rawOnly(inner, 2, 0, "party_signing_keys threshold")?.value ?? 0;
+  if (threshold !== 1) {
+    throw new OnboardingTopologyMismatchError(
+      `onboarding PartyToParticipant party_signing_keys has threshold ${threshold} (expected 1) - ` +
+        `refusing to sign (the agent's key must be able to sign alone and be the only signer)`
+    );
+  }
+  if (keys.length !== 1) {
+    throw new OnboardingTopologyMismatchError(
+      `onboarding PartyToParticipant party_signing_keys carries ${keys.length} keys (expected ` +
+        `exactly 1, the agent's own) - refusing to sign (an extra key would let its holder ` +
+        `authorize the agent's spends)`
+    );
+  }
+  const publicKey = rawOnly(rawFields(keys[0]!.bytes!), 3, 2, "SigningPublicKey.public_key");
+  if (publicKey === undefined || !isAgentKey({ publicKey: publicKey.bytes! })) {
+    throw new OnboardingTopologyMismatchError(
+      "onboarding PartyToParticipant party_signing_keys key is NOT the agent's own key - " +
+        "refusing to sign (the topology would onboard a foreign signing key)"
+    );
+  }
+}
+
 function assertOnboardingTopologyDecodeBindsKey(
   onboardingTransactionsB64: string[],
   expect: OnboardingTopologyExpectation,
@@ -568,9 +729,10 @@ function assertOnboardingTopologyDecodeBindsKey(
   let sawP2PForAgent = false;
 
   for (const txB64 of onboardingTransactionsB64) {
+    const raw = rawTopologyMapping(txB64);
     let tx: TopologyTransaction;
     try {
-      tx = decodeTopologyTransaction(txB64);
+      tx = decodeTopologyTransaction(raw.tx.toString("base64"));
     } catch (e) {
       throw new OnboardingTopologyMismatchError(
         `could not decode a relay-returned onboarding transaction as a Canton ` +
@@ -579,11 +741,33 @@ function assertOnboardingTopologyDecodeBindsKey(
       );
     }
 
+    // The typed decoder does not check wire types: a field sent with the wrong
+    // one is read as something Canton never sees (Canton skips it as unknown).
+    // Require the bytes to be exactly what the typed decode encodes back to.
+    if (!Buffer.from(TopologyTransaction.toBinary(tx)).equals(raw.tx)) {
+      throw new OnboardingTopologyMismatchError(
+        "a relay-returned onboarding transaction is not canonically encoded - refusing to " +
+          "sign (the typed decode may differ from what Canton applies)"
+      );
+    }
+
     const mapping = tx.mapping?.mapping;
     if (!mapping || mapping.oneofKind === undefined) {
       throw new OnboardingTopologyMismatchError(
         "a relay-returned onboarding transaction has no topology mapping — refusing " +
           "to sign (cannot account for an empty/unknown mapping in the bundle)"
+      );
+    }
+
+    // The raw read must see the same mapping kind as the typed decode, so the
+    // signing-key check below runs on the PartyToParticipant Canton will apply.
+    if (
+      (raw.no === TOPOLOGY_MAPPING_PARTY_TO_PARTICIPANT) !==
+      (mapping.oneofKind === "partyToParticipant")
+    ) {
+      throw new OnboardingTopologyMismatchError(
+        `onboarding transaction decodes as ${mapping.oneofKind} but its raw mapping is ` +
+          `field ${raw.no} - refusing to sign (ambiguous encoding)`
       );
     }
 
@@ -669,6 +853,7 @@ function assertOnboardingTopologyDecodeBindsKey(
               "sign (the party would be unhosted/sane-check failed)"
           );
         }
+        assertPartySigningKeys(raw.bytes, isAgentKey);
         sawP2PForAgent = true;
         break;
       }

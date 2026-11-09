@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from "vitest";
 import { mergeHoldings, mergeAllRegistryHoldings } from "./merge.js";
 import { sumLedgerDecimals } from "@ftptech/x402-canton-core";
-import type { RelayClient } from "./relay-client.js";
+import { RelayHttpError, type RelayClient } from "./relay-client.js";
 import type { AgentWallet } from "./store.js";
 import type { transfer } from "./tx.js";
 
@@ -286,5 +286,53 @@ describe("merge --all-tokens on a view with nothing to merge", () => {
   it("an incomplete view WITH something to merge still needs --yes (size unknown)", async () => {
     const view = { instruments: [{ admin: CBTC, id: "CBTC", holdings: h("b", 5) }], complete: false };
     await expect(mergeAllRegistryHoldings(sliceRelay([view]).relay, wallet(), { transferFn: recorder().fn })).rejects.toThrow(/--yes/);
+  });
+});
+
+describe("registry merge — a busy relay on the holdings read is waited on", () => {
+  const busyRead = (status: number, body: unknown, retryAfter: number) =>
+    new RelayHttpError(`relay GET /v1/wallet/x/holdings -> ${status}`, status, body, false, retryAfter);
+  /** A holdings read that answers each entry in turn: an Error is thrown. */
+  function flakyRelay(seq: Array<Error | { instruments: Ins[]; complete: boolean }>) {
+    let i = 0;
+    const holdings = vi.fn(async (_p: string, ins?: { admin: string; id: string }) => {
+      const v = seq[Math.min(i++, seq.length - 1)]!;
+      if (v instanceof Error) throw v;
+      const instruments = (ins ? v.instruments.filter((x) => x.admin === ins.admin && x.id === ins.id) : v.instruments)
+        .map((x) => ({ ...x, total: "0" }));
+      return { party: PARTY, instruments, complete: v.complete };
+    });
+    return { relay: { holdings } as unknown as RelayClient, holdings };
+  }
+
+  it("per token: a 429 on the first read and a shed re-read are both waited out", async () => {
+    const { relay, holdings } = flakyRelay([
+      busyRead(429, { error: "too many wallet reads; retry in a minute" }, 60),
+      { instruments: [{ admin: ADMIN, id: "USDCx", holdings: h("a", 2) }], complete: true },
+      busyRead(503, { error: "scan_busy" }, 2),
+      { instruments: [{ admin: ADMIN, id: "USDCx", holdings: h("b", 1) }], complete: true },
+    ]);
+    const t = recorder();
+    const waits: number[] = [];
+    const res = await mergeHoldings(relay, wallet(), {
+      instrumentAdmin: ADMIN, instrumentId: "USDCx", trustedRegistryParties: TRUSTED, transferFn: t.fn,
+      sleepFn: async (ms) => void waits.push(ms),
+    });
+    expect(waits).toEqual([60_000, 2_000]);
+    expect(holdings).toHaveBeenCalledTimes(4);
+    expect(res).toMatchObject({ rounds: 1, finalHoldings: 1 });
+  });
+
+  it("all tokens: a shed first read is waited out", async () => {
+    const { relay } = flakyRelay([
+      busyRead(503, { error: "scan_busy" }, 1),
+      { instruments: [{ admin: CBTC, id: "CBTC", holdings: h("b", 2) }], complete: true },
+      { instruments: [{ admin: CBTC, id: "CBTC", holdings: h("c", 1) }], complete: true },
+    ]);
+    const t = recorder();
+    const waits: number[] = [];
+    const res = await mergeAllRegistryHoldings(relay, wallet(), { transferFn: t.fn, sleepFn: async (ms) => void waits.push(ms) });
+    expect(waits).toEqual([1_000]);
+    expect(res).toMatchObject({ rounds: 1, finalHoldings: 1 });
   });
 });

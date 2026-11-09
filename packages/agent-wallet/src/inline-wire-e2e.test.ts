@@ -43,6 +43,8 @@ const PREPARED = buildPrepared({
   amount: LEDGER_AMOUNT,
   admin: DSO,
   id: "Amulet",
+  // The DSO is pinned: its factory must be among the input contracts.
+  rootInput: [DSO],
 });
 /** BASE64 — the shape Canton's interactive-submission prepare really returns.
  *  Writing hex here would make this suite agree with the bug it exists to

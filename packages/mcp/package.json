@@ -1,8 +1,8 @@
 {
   "name": "@ftptech/canton-x402-mcp",
   "private": false,
-  "version": "2.3.0",
-  "description": "MCP server exposing a self-custody Canton x402 agent wallet as tools. A human connects it out-of-band (claude mcp add); read tools auto-allow, pay/withdraw are ask/cap. Thin wrapper over @ftptech/canton-agent-wallet.",
+  "version": "2.7.0",
+  "description": "MCP server that gives an AI agent a self-custody Canton x402 wallet with spend limits set by its owner.",
   "license": "Apache-2.0",
   "author": "FTP team",
   "type": "module",
@@ -16,9 +16,10 @@
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run",
+    "gen:guide": "node scripts/gen-guide.mjs",
+    "build": "node scripts/gen-guide.mjs && tsc -p tsconfig.json",
+    "typecheck": "node scripts/gen-guide.mjs && tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/gen-guide.mjs && vitest run",
     "lint": "eslint src --max-warnings 0"
   },
   "engines": {
@@ -26,7 +27,8 @@
   },
   "dependencies": {
     "@ftptech/canton-agent-wallet": "workspace:^",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@ftptech/x402-canton-core": "^1.9.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^3.25.76"
   },
   "publishConfig": {

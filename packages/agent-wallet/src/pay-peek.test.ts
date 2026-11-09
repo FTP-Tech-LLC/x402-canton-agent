@@ -69,3 +69,24 @@ describe("peekWalletPayment", () => {
     expect(peekWalletPayment(cantrust402(), WALLET, { preferAsset: "CBTC" })).toBeUndefined();
   });
 });
+
+describe("peekWalletPayment with a default asset", () => {
+  /** USDCx listed first, Canton Coin second. */
+  function usdcxFirst402(): Response {
+    return new Response("payment required", {
+      status: 402,
+      headers: {
+        [HEADER_PAYMENT_REQUIRED_V2]: encodeBase64Json({
+          x402Version: 2,
+          resource: { url: "https://x.example/" },
+          accepts: [entry("USDCx", "351000000", USDCX), entry("CC", "3307888041", { admin: "DSO::1220b1431ef21", id: "Amulet" })],
+        }),
+      },
+    });
+  }
+
+  it("names the entry pay would pay: the default asset when offered, and preferAsset over it", () => {
+    expect(peekWalletPayment(usdcxFirst402(), WALLET, { defaultAsset: "CC" })).toEqual({ payTo: MERCHANT, amountAtomic: "3307888041" });
+    expect(peekWalletPayment(usdcxFirst402(), WALLET, { defaultAsset: "CC", preferAsset: "USDCx" })?.amountAtomic).toBe("351000000");
+  });
+});

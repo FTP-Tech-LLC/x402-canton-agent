@@ -101,3 +101,26 @@ authorize nothing further. The round trip they belong to: 30 CC in, batcher,
 Every record is fully labelled in Daml declaration order (matches the DAR).
 The Tradecraft choices read the ledger time, so `max_ledger_effective_time`
 equals `preparationTime` on all of them.
+
+## Registry offer withdraw (reclaim)
+
+Two captures, taken 2026-10-24 off the live MainNet participant, PREPARED ONLY
+(never signed or submitted): a hosted wallet
+(`agent::1220caaddc91c71d90c976750c28700c9739bdca5e047d95b0136e4325973902d9ed`)
+withdrawing its own `TransferOffer`s to `cantex-swap::122038c0…0909b8c`, which
+Cantex left in `TransferPendingReceiverAcceptance` past `executeBefore`. Used
+by `assertPreparedWithdrawMatches` (core) and `reclaimExpiredOffers`.
+
+| file | offer cid | instrument (admin) | preparationTime (µs) |
+|---|---|---|---|
+| `mainnet-registry-withdraw-exag.b64` | `00d7d056db901146…feec6a` | eXAG (`ember-silver::1220ad9c…cc79c4`) | 1792859144533175 |
+| `mainnet-registry-withdraw-ceth.b64` | `001dc92a240d45e3…fe7063` | cETH (`rails-cethMain-1::12200350…29003a`) | 1792859145517062 |
+
+Structure (both): root `TransferInstruction_Withdraw` on
+`Utility.Registry.App.V0.Model.Transfer:TransferOffer` → a Fetch, one create of
+the agent's unlocked `Utility.Registry.Holding.V0.Holding:Holding`,
+`EventLog_HoldingsChange` on the Holding, and the `Archive` of the locked
+Holding. `actAs` is the agent alone; the created holding names the agent, the
+registrar, the DA registry operator (`auth0_007c…d7c78e`) and, for eXAG, the
+registrar's own validator (same namespace).
+

@@ -28,6 +28,7 @@
  * DO NOT loosen these tests to make them pass. Fix the production code.
  */
 import { describe, it, expect, beforeAll } from "vitest";
+import { readFileSync } from "node:fs";
 import { generateAgentKey } from "./keys.js";
 import {
   assertOnboardingTopologyBindsKey,
@@ -42,7 +43,13 @@ import {
   partyToParticipantTx,
   keyFingerprint,
   faithfulOnboarding,
+  partyToParticipantBytes,
+  signingKeysWithThreshold,
+  partyToParticipantRawTx,
+  partyToParticipantWithKeysTx,
+  versionedTx,
 } from "./_topology-fixture.js";
+import { len, vintField } from "./_prepared-fixture.js";
 
 const KEY = generateAgentKey();
 const POINT = rawPoint(KEY.publicKeySpkiB64);
@@ -214,5 +221,121 @@ describe("C4: onboarding topology must structurally bind the agent's own key", (
     const derKey = signingKey(Buffer.from(KEY.publicKeySpkiB64, "base64"));
     const txs = [partyToKeyTx(PARTY, [derKey], 1)];
     expect(() => assertOnboardingTopologyBindsKey(txs, EXPECT)).not.toThrow();
+  });
+});
+
+describe("PartyToParticipant.party_signing_keys must hold only the agent's key", () => {
+  const ATTACKER = signingKey(rawPoint(generateAgentKey().publicKeySpkiB64));
+  const nsTx = () => namespaceDelegationTx(FINGERPRINT, signingKey(POINT));
+
+  it("ACCEPTS the live MainNet generate-topology capture (enveloped, key in field 6)", () => {
+    const vectors = JSON.parse(
+      readFileSync(new URL("../../ledger/src/_conformance-vectors.json", import.meta.url), "utf8")
+    ) as {
+      topology: {
+        onboardingTransactions: string[];
+        publicKeyKeyData: string;
+        publicKeyFingerprint: string;
+      }[];
+    };
+    const v = vectors.topology[0]!;
+    expect(() =>
+      assertOnboardingTopologyBindsKey(v.onboardingTransactions, {
+        publicKeySpkiB64: v.publicKeyKeyData,
+        party: `vectorcap::${v.publicKeyFingerprint}`,
+        publicKeyFingerprint: v.publicKeyFingerprint,
+      })
+    ).not.toThrow();
+  });
+
+  it("ACCEPTS party_signing_keys = {agent key} threshold 1, bare and enveloped", () => {
+    const p2p = partyToParticipantWithKeysTx(PARTY, [signingKey(POINT)], 1);
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).not.toThrow();
+    expect(() =>
+      assertOnboardingTopologyBindsKey([versionedTx(nsTx()), versionedTx(p2p)], EXPECT)
+    ).not.toThrow();
+  });
+
+  it("REJECTS an extra relay key next to the agent's (1 of 2)", () => {
+    const p2p = partyToParticipantWithKeysTx(PARTY, [signingKey(POINT), ATTACKER], 1);
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).toThrow(
+      /party_signing_keys carries 2 keys/
+    );
+    expect(() =>
+      assertOnboardingTopologyBindsKey([versionedTx(nsTx()), versionedTx(p2p)], EXPECT)
+    ).toThrow(/party_signing_keys carries 2 keys/);
+  });
+
+  it("REJECTS a foreign key as the only signing key", () => {
+    const p2p = partyToParticipantWithKeysTx(PARTY, [ATTACKER], 1);
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).toThrow(
+      /NOT the agent's own key/
+    );
+  });
+
+  it("REJECTS a threshold other than 1", () => {
+    for (const threshold of [0, 2]) {
+      const p2p = partyToParticipantWithKeysTx(PARTY, [signingKey(POINT)], threshold);
+      expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).toThrow(
+        new RegExp(`threshold ${threshold} \\(expected 1\\)`)
+      );
+    }
+  });
+
+  it("REJECTS an empty key set", () => {
+    const p2p = partyToParticipantWithKeysTx(PARTY, [], 1);
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).toThrow(
+      /carries 0 keys/
+    );
+  });
+
+  it("REJECTS a second party_signing_keys occurrence (merged by the participant)", () => {
+    const p2p = partyToParticipantRawTx(
+      Buffer.concat([
+        partyToParticipantBytes(PARTY),
+        len(6, signingKeysWithThreshold([signingKey(POINT)], 1)),
+        len(6, signingKeysWithThreshold([ATTACKER], 1)),
+      ])
+    );
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).toThrow(
+      OnboardingTopologyMismatchError
+    );
+  });
+
+  it("REJECTS an unknown PartyToParticipant field", () => {
+    const p2p = partyToParticipantRawTx(
+      Buffer.concat([partyToParticipantBytes(PARTY), vintField(7, 1)])
+    );
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), p2p], EXPECT)).toThrow(
+      /unknown field 7/
+    );
+  });
+
+  it("REJECTS an envelope carrying a second mapping outside its data", () => {
+    // The typed decoder reads envelope fields as TopologyTransaction fields, so
+    // an extra field 3 here would replace the mapping it reports.
+    const p2p = partyToParticipantWithKeysTx(PARTY, [signingKey(POINT), ATTACKER], 1);
+    const smuggled = Buffer.concat([
+      Buffer.from(versionedTx(p2p), "base64"),
+      Buffer.from(partyToKeyTx(PARTY, [signingKey(POINT)], 1), "base64"),
+    ]).toString("base64");
+    expect(() => assertOnboardingTopologyBindsKey([nsTx(), smuggled], EXPECT)).toThrow(
+      OnboardingTopologyMismatchError
+    );
+  });
+
+  it("REJECTS a decoy mapping hidden in a wrong-wire-type field", () => {
+    // Canton skips a length-delimited field 1 as unknown and applies the foreign
+    // NamespaceDelegation; the typed decoder reads its payload as fields and
+    // reports the agent-only decoy instead.
+    const foreign = Buffer.from(namespaceDelegationTx(FINGERPRINT, ATTACKER), "base64");
+    for (const decoy of [nsTx(), partyToKeyTx(PARTY, [signingKey(POINT)], 1)]) {
+      const tx = versionedTx(
+        Buffer.concat([foreign, len(1, Buffer.from(decoy, "base64"))]).toString("base64")
+      );
+      expect(() =>
+        assertOnboardingTopologyBindsKey([tx, versionedTx(partyToParticipantTx(PARTY))], EXPECT)
+      ).toThrow(/not canonically encoded/);
+    }
   });
 });

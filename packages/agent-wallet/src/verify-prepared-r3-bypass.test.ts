@@ -28,6 +28,7 @@ import {
 } from "./verify-prepared.js";
 import {
   choiceArgument,
+  rootInputContract,
   str,
   len,
   vintField,
@@ -244,8 +245,10 @@ describe("R3-3 — no-pin admin/dso aliasing whitelists the attacker outside the
       signatories: [SENDER, DSO],
       stakeholders: [SENDER, DSO, MERCHANT],
     });
+    // With the DSO pinned, the root must be its factory among the input contracts.
+    const md = metadata({ inputContracts: [rootInputContract({ dso: DSO })] });
     expect(() =>
-      assertPreparedTransferMatches(wrap([honestCipExercise({}, ["1"]), child], ["0"]), CIP_EXPECT_PINNED)
+      assertPreparedTransferMatches(wrap([honestCipExercise({}, ["1"]), child], ["0"], md), CIP_EXPECT_PINNED)
     ).not.toThrow();
   });
 });

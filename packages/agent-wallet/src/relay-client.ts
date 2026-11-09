@@ -4,6 +4,9 @@
  * the validator token (onboarding + interactive submission) and proxies the
  * public Scan registry resolves (the agent has no Scan access).
  */
+import { connectionNeverEstablished } from "@ftptech/x402-canton-core";
+import type { ReadProofParts } from "./keys.js";
+
 export interface RelayPublicKey {
   format: string;
   keyData: string;
@@ -56,6 +59,56 @@ export interface ContractsResult {
     interfaceViews?: Array<{ interfaceId: string; viewValue: Record<string, unknown> }>;
   }>;
 }
+/** One transaction of a party's Tradecraft history, reduced by the relay to the
+ *  party's own orders, settlement legs and withdrawal requests. */
+export interface TradecraftUpdate {
+  offset: number;
+  updateId: string;
+  recordTime?: string;
+  orders: Array<{
+    /** `archived`: closed by a choice the relay does not interpret (see `choice`). */
+    kind: "created" | "filled" | "cancelled" | "withdrawn" | "expired" | "archived";
+    orderCid: string;
+    choice?: string;
+    ammId?: string;
+    sell?: { instrument: { admin: string; id: string }; amount: string };
+    minOut?: string | null;
+    createdAt?: string;
+    reason?: string;
+  }>;
+  allocations: Array<{
+    allocationCid: string;
+    previousAllocationCid?: string;
+    ammId: string;
+    instrument: { admin: string; id: string };
+    fundingAfter: Record<string, string>;
+    legs: Array<{ side: "receive" | "send"; amount: string; instrumentId: string; counterparty?: string }>;
+  }>;
+  withdrawals: Array<{
+    kind: "requested" | "fulfilled" | "rejected" | "cancelled" | "archived";
+    requestCid: string;
+    choice?: string;
+    ammId?: string;
+    instrument?: { admin: string; id: string };
+    reason?: unknown;
+  }>;
+  /** The party's records in this transaction the relay could not read. */
+  anomalies?: Array<{ ammId?: string; detail: string }>;
+}
+export interface TradecraftUpdatesResult {
+  party: string;
+  /** Which participant the offsets belong to; restart from 0 when it changes. */
+  participant?: string;
+  /** False when the relay does not read withdrawal requests. */
+  withdrawalsRead?: boolean;
+  after: number;
+  /** Pass back as `after` to continue. */
+  next: number;
+  ledgerEnd: number;
+  /** True when this page reached the ledger end the relay read against. */
+  complete: boolean;
+  updates: TradecraftUpdate[];
+}
 export interface BalanceResult {
   party: string;
   amulet: number;
@@ -97,6 +150,21 @@ export interface PendingResult {
     instrumentId?: { admin: string; id: string };
     /** ISO instant after which the ledger refuses the accept; absent on older relays. */
     executeBefore?: string;
+  }>;
+}
+/** The party's own pending registry offers — what it SENT that the receiver has
+ *  not taken — for reclaim (`GET /v1/wallet/:party/outgoing`). */
+export interface OutgoingResult {
+  party: string;
+  outgoing: Array<{
+    cid: string;
+    amount?: string;
+    receiver?: string;
+    instrumentId: { admin: string; id: string };
+    /** ISO instant after which the receiver can no longer accept. */
+    executeBefore?: string;
+    /** The instruction's status tag, e.g. TransferPendingReceiverAcceptance. */
+    status?: string;
   }>;
 }
 /** The Amulet OUTPUT holdings a transfer transaction created for the party, read
@@ -157,8 +225,37 @@ export function explainRelayFailure(body: string): string | undefined {
       `and allowlist are not involved, and nothing was charged (it fails before signing).`
     );
   }
+  // The submission's completion was a rejection: the transaction did not
+  // commit, so running it again is safe. INACTIVE and
+  // LOCKED contracts mean something it spends changed meanwhile (MainNet,
+  // 2026-11-04: a Tradecraft settlement recreated the allocation a top-up was
+  // spending).
+  const verdict = PARTICIPANT_REJECTED.exec(body);
+  if (verdict) {
+    // Only this transaction is known not to have committed: a command of
+    // several steps keeps the ones it finished, and a LOCKED input belongs to
+    // another transaction still in flight, which may be this command's own
+    // earlier run.
+    if (/LOCKED_CONTRACTS/.test(verdict[1]!)) {
+      return (
+        `the participant rejected the transaction (${verdict[1]}): another pending transaction holds an ` +
+        "input of this one. Wait for it, then check `balance` before running this again."
+      );
+    }
+    return (
+      `the participant rejected the transaction (${verdict[1]})` +
+      (/INACTIVE_CONTRACTS/.test(verdict[1]!) ? ": a contract it spends changed meanwhile" : "") +
+      ". This transaction did not commit and charged nothing. Steps this command finished before it stand: " +
+      "check `balance` (and `tc status`) before running it again."
+    );
+  }
   return undefined;
 }
+
+/** A relay answer that carries a rejected completion: the relay read the
+ *  submission's completion and its status was a rejection (ledger client's
+ *  pollCompletionUpdateId), so the transaction did not commit. */
+const PARTICIPANT_REJECTED = /interactive submission rejected: ([A-Z][A-Z0-9_]+)/;
 
 /**
  * The relay routes a PAYMENT and a CLAIM travel, as this client calls them. The
@@ -178,12 +275,13 @@ export const PAY_AND_CLAIM_RELAY_ROUTES = {
   submitExecute: "/v1/wallet/submit/execute",
 } as const;
 
-/** Relay calls that SUBMIT to the ledger. A timeout on one of these is not a
- *  failure: the submission may still commit, so it must not read as "retry". */
+/** Relay calls that SUBMIT to the ledger. A timeout, dropped connection or 5xx
+ *  on one of these is not a failure: the submission may still commit, so it
+ *  must not read as "retry". Onboarding is left out: nothing can be paid twice
+ *  there, and a re-run makes a new party. */
 const SUBMITTING_ROUTES: readonly RegExp[] = [
   /^\/v1\/wallet\/submit\/execute$/,
   /^\/v1\/wallet\/preapproval\/self\/commit$/,
-  /^\/v1\/wallet\/onboard\/finalize$/,
   /^\/v1\/merchants\/[^/]+\/preapproval$/,
 ];
 
@@ -214,6 +312,32 @@ export class RelayTimeoutError extends Error {
   }
 }
 
+const MAY_STILL_COMMIT =
+  "the submission may still commit. Check `canton-agent-wallet balance` " +
+  "before retrying, or you may pay twice";
+
+/** The connection failed on a call that submits to the ledger (reset, closed
+ *  socket, unreadable answer). The relay may already hold the signed request,
+ *  so like a timeout there the outcome is unknown: "could not reach the relay"
+ *  would read as "nothing happened, retry", and a retry can pay twice. */
+export class RelayOutcomeUnknownError extends Error {
+  readonly outcomeUnknown = true;
+  constructor(
+    readonly method: string,
+    readonly path: string,
+    cause: unknown
+  ) {
+    const why = (cause as { cause?: { message?: unknown } } | null)?.cause?.message;
+    super(
+      `relay ${method} ${path} connection failed` +
+        (typeof why === "string" && why ? ` (${why})` : "") +
+        `: ${MAY_STILL_COMMIT}`,
+      { cause }
+    );
+    this.name = "RelayOutcomeUnknownError";
+  }
+}
+
 function resolveRelayTimeoutMs(explicit: number | undefined): number {
   if (explicit !== undefined) return explicit;
   const env = Number(process.env.CANTON_AGENT_RELAY_TIMEOUT_MS);
@@ -225,7 +349,11 @@ export class RelayHttpError extends Error {
     message: string,
     readonly status: number,
     /** The parsed JSON response body, or undefined when it was not JSON. */
-    readonly body: unknown
+    readonly body: unknown,
+    readonly outcomeUnknown = false,
+    /** The relay's Retry-After in whole seconds, when it sent one as a number
+     *  (a busy relay says how long to wait; an HTTP-date form is not read). */
+    readonly retryAfterSeconds?: number
   ) {
     super(message);
     this.name = "RelayHttpError";
@@ -247,6 +375,39 @@ export function isHoldingsExceedNodeLimitError(err: unknown): boolean {
   return /holdings_exceed_node_limit/.test(msg) || /-> 413\b/.test(msg);
 }
 
+/** True when `err`, or an error it wraps, is a relay submission whose outcome
+ *  is unknown (timeout, dropped connection or 5xx on a submitting route). */
+export function isOutcomeUnknownError(err: unknown): boolean {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 6; depth++) {
+    if ((cur as { outcomeUnknown?: unknown }).outcomeUnknown === true) return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Signs a relay read as one party (see `X-Canton-Read-Proof`). The signer
+ *  builds the message from these parts itself; see `readSignerFromWallet`. */
+export interface RelayReadSigner {
+  party: string;
+  sign(parts: ReadProofParts): Uint8Array;
+}
+
+const READ_PROOF_HEADER = "x-canton-read-proof";
+/** The relay's per-party GETs that can carry a proof. The facilitator keeps the
+ *  same list (READ_PROOF_ROUTES in routes/read-proof.ts); a test holds them equal. */
+export const READ_PROOF_ROUTES = [
+  "holdings",
+  "balance",
+  "holdings-scan",
+  "contracts",
+  "tradecraft-updates",
+  "tx-amulets",
+  "pending",
+  "outgoing",
+] as const;
+const PROVABLE_READ = new RegExp(`^/v1/wallet/([^/]+)/(?:${READ_PROOF_ROUTES.join("|")})$`);
+
 export class RelayClient {
   private readonly timeoutMs: number;
 
@@ -256,6 +417,9 @@ export class RelayClient {
       apiKey?: string | undefined;
       /** Per-request timeout; default CANTON_AGENT_RELAY_TIMEOUT_MS or 120 s. */
       timeoutMs?: number;
+      /** When set, reads of THIS party carry a signed proof the relay can check.
+       *  Nothing else the client sends changes. */
+      readSigner?: RelayReadSigner | undefined;
     }
   ) {
     this.timeoutMs = resolveRelayTimeoutMs(opts.timeoutMs);
@@ -267,6 +431,43 @@ export class RelayClient {
     return h;
   }
 
+  /**
+   * `X-Canton-Read-Proof: v1.<timestampMs>.<signature base64url>` for a read of
+   * the signer's own party; none for any other request. The signature covers
+   * the method, the host the client connects to, the decoded path, the raw
+   * query, the party and the timestamp (see `readSignerFromWallet`).
+   */
+  private readProof(method: string, path: string): Record<string, string> {
+    const signer = this.opts.readSigner;
+    if (!signer || method !== "GET") return {};
+    const q = path.indexOf("?");
+    const route = q === -1 ? path : path.slice(0, q);
+    const m = PROVABLE_READ.exec(route);
+    if (!m) return {};
+    try {
+      const party = decodeURIComponent(m[1]!);
+      if (party !== signer.party) return {};
+      // Sign what fetch puts on the wire: the URL parser re-encodes some
+      // characters (a "'" in the query becomes %27), and the relay sees those.
+      const wire = new URL(this.opts.relayUrl.replace(/\/$/, "") + path);
+      const timestampMs = Date.now();
+      const signature = Buffer.from(
+        signer.sign({
+          method,
+          host: wire.host.toLowerCase(),
+          pathname: decodeURIComponent(wire.pathname),
+          query: wire.search.slice(1),
+          timestampMs,
+        })
+      ).toString("base64url");
+      return { [READ_PROOF_HEADER]: `v1.${timestampMs}.${signature}` };
+    } catch {
+      // A proof is optional while the relay only measures: a signer that
+      // fails must not fail the read.
+      return {};
+    }
+  }
+
   private async req<T>(
     method: string,
     path: string,
@@ -275,24 +476,24 @@ export class RelayClient {
   ): Promise<T> {
     const url = this.opts.relayUrl.replace(/\/$/, "") + path;
     const route = path.split("?")[0]!;
+    const submitting = SUBMITTING_ROUTES.some((re) => re.test(route));
     let r: Response;
     let text: string;
     try {
       r = await fetch(url, {
         method,
-        headers: { ...this.headers(), ...(extraHeaders ?? {}) },
+        headers: { ...this.headers(), ...this.readProof(method, path), ...(extraHeaders ?? {}) },
         ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
         signal: AbortSignal.timeout(this.timeoutMs),
       });
       text = await r.text();
     } catch (err) {
       if ((err as { name?: unknown } | null)?.name === "TimeoutError") {
-        throw new RelayTimeoutError(
-          method,
-          route,
-          this.timeoutMs,
-          SUBMITTING_ROUTES.some((re) => re.test(route))
-        );
+        throw new RelayTimeoutError(method, route, this.timeoutMs, submitting);
+      }
+      // Unless the connection never opened, a failed submission may have landed.
+      if (submitting && !connectionNeverEstablished(err)) {
+        throw new RelayOutcomeUnknownError(method, route, err);
       }
       throw err;
     }
@@ -310,11 +511,19 @@ export class RelayClient {
       // ("Ledger time is at or ...") and drops the only two facts the payer can
       // act on — which deadline lapsed, and when.
       const why = explainRelayFailure(text);
+      // The relay answers 5xx when its own hop to the participant fails, which
+      // can be after the participant took a submission: only a 4xx is a refusal.
+      // A rejection verdict is the participant's answer, so not unknown.
+      const outcomeUnknown = submitting && r.status >= 500 && !PARTICIPANT_REJECTED.test(text);
+      const retryAfter = Number(r.headers?.get?.("retry-after") ?? NaN);
       throw new RelayHttpError(
         `relay ${method} ${path} -> ${r.status} ${text.slice(0, 200)}` +
-          (why ? `\n  ${why}` : ""),
+          (why ? `\n  ${why}` : "") +
+          (outcomeUnknown ? `\n  ${MAY_STILL_COMMIT}` : ""),
         r.status,
-        json
+        json,
+        outcomeUnknown,
+        Number.isInteger(retryAfter) && retryAfter >= 0 ? retryAfter : undefined
       );
     }
     return json as T;
@@ -593,6 +802,15 @@ export class RelayClient {
   resolveAccept(b: { instructionCid: string; instrumentAdmin?: string }) {
     return this.req<ResolveAcceptResult>("POST", PAY_AND_CLAIM_RELAY_ROUTES.resolveAccept, b);
   }
+  /** The party's own pending registry offers, for reclaim. A relay that predates
+   *  the route answers 404 (RelayHttpError.status). */
+  outgoing(party: string) {
+    return this.req<OutgoingResult>("GET", `/v1/wallet/${encodeURIComponent(party)}/outgoing`);
+  }
+  /** The registry's withdraw choice-context for the party's own offer. */
+  resolveWithdraw(b: { instructionCid: string; instrumentAdmin: string }) {
+    return this.req<ResolveAcceptResult>("POST", "/v1/wallet/resolve/withdraw", b);
+  }
   /** Read the Amulet OUTPUT cids a transfer transaction created for `party`, by
    *  updateId (whale-merge output discovery — the agent is relay-only). The relay
    *  reads the tx (getTransactionById, bounded per-tx, immune to the ACS element
@@ -630,6 +848,19 @@ export class RelayClient {
     return this.req<ContractsResult>(
       "GET",
       `/v1/wallet/${encodeURIComponent(party)}/contracts?${k}=${encodeURIComponent(v)}`
+    );
+  }
+  /** One page of the party's Tradecraft history after ledger offset `after`:
+   *  fills, cancellations, settlement legs. Continue from `next` until
+   *  `complete`. Offsets belong to the participant hosting the party. */
+  tradecraftUpdates(party: string, q: { after?: number; limit?: number } = {}) {
+    const params = new URLSearchParams();
+    if (q.after !== undefined) params.set("after", String(q.after));
+    if (q.limit !== undefined) params.set("limit", String(q.limit));
+    const qs = params.toString();
+    return this.req<TradecraftUpdatesResult>(
+      "GET",
+      `/v1/wallet/${encodeURIComponent(party)}/tradecraft-updates${qs ? `?${qs}` : ""}`
     );
   }
 }

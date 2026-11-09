@@ -171,10 +171,12 @@ export interface ResolvedSwapTicket {
  * Venue rules (identical for every caller):
  *  - `cantex` (default): a CC input below Cantex's minimum, or a Cantex quote
  *    failure, routes to Tradecraft — unless the caller named cantex explicitly,
- *    in which case it is an error.
+ *    in which case it is an error. A token input routes to Tradecraft unless
+ *    cantex is named (Cantex has left token sells unaccepted).
  *  - `tradecraft`: Tradecraft only.
  *  - `auto`: FREE direct quotes from every eligible venue, best expected output
  *    wins; one venue erroring uses the other. Never pays the endpoint fee.
+ *    Cantex is not eligible for a token input.
  */
 export async function resolveSwapTicket(
   opts: ResolveSwapTicketOpts
@@ -208,6 +210,11 @@ export async function resolveSwapTicket(
   // the default/auto paths fall back to Tradecraft if it still cannot quote.
   const inputIsCC = intent.inInstrument === null;
   const cantexRuledOut = inputIsCC && Number(amount) < CANTEX_MIN_INPUT_CC;
+  // A token input reaches Cantex as a two-step offer, and Cantex has left such
+  // offers unaccepted (MainNet, 24.10: eXAG and cETH sells, input locked until
+  // the offer was withdrawn). Until that path is confirmed, a token input goes
+  // to Tradecraft unless the caller names cantex, and auto does not quote it.
+  const cantexTokenSell = !inputIsCC;
 
   const resolveDirect = async (v: SwapVenue): Promise<SwapTicket> => {
     if (v === "cantex") {
@@ -267,15 +274,33 @@ export async function resolveSwapTicket(
       venue: v,
     });
   };
-  const resolveOne = (v: SwapVenue): Promise<SwapTicket> =>
-    opts.direct ? resolveDirect(v) : resolveEndpoint(v);
+  // Below Tradecraft's advertised minimum the pool hands the input back
+  // unfilled (MainNet, 2026-11-04: 0.629 USDXLR against 1, and 0.000022 cETH
+  // against 0.0006, both returned). A bought ticket is then a fee paid for
+  // nothing, so the endpoint path refuses before buying it; a direct swap,
+  // which pays no fee, may still try.
+  const tcMin = tradecraftMinInput(intent.inCanon);
+  const belowTcMin = tcMin !== undefined && Number(amount) < tcMin;
+  const resolveOne = (v: SwapVenue): Promise<SwapTicket> => {
+    if (opts.direct) return resolveDirect(v);
+    if (v === "tradecraft" && belowTcMin) {
+      return Promise.reject(
+        new Error(
+          `swap: ${amount} ${intent.inCanon} is below Tradecraft's advertised minimum of ${tcMin} ${intent.inCanon}, ` +
+            `so the pool would not take it and the ticket fee would be lost. Nothing was paid. ` +
+            `To try anyway without a ticket, swap direct (CLI --direct, MCP direct: true).`
+        )
+      );
+    }
+    return resolveEndpoint(v);
+  };
 
   let ticket: SwapTicket;
   if (opts.venue === "auto") {
     // Compare FREE direct quotes from eligible venues and pick the better output
     // (auto never pays the endpoint fee twice). One venue erroring uses the other.
     const candidates: SwapVenue[] = [];
-    if (!cantexRuledOut) candidates.push("cantex");
+    if (!cantexRuledOut && !cantexTokenSell) candidates.push("cantex");
     candidates.push("tradecraft");
     const settled = await Promise.allSettled(candidates.map(resolveDirect));
     const ok = settled
@@ -303,7 +328,13 @@ export async function resolveSwapTicket(
       `auto: ${ok.map((t) => `${t.venue} ~${t.quote}`).join(", ")} -> chose ${ticket.venue}`
     );
   } else if (opts.venue === "cantex") {
-    if (cantexRuledOut) {
+    if (cantexTokenSell && !opts.venueExplicit) {
+      note(
+        "warn",
+        `Cantex has left token sells unaccepted; routing ${intent.inCanon} to Tradecraft (name the cantex venue to use it anyway)`
+      );
+      ticket = await resolveOne("tradecraft");
+    } else if (cantexRuledOut) {
       const reason = `Cantex Connect minimum is ${CANTEX_MIN_INPUT_CC} CC (got ${amount} CC)`;
       if (opts.venueExplicit) {
         throw new Error(`swap: ${reason} — use the tradecraft venue`);
@@ -316,6 +347,13 @@ export async function resolveSwapTicket(
       // the error. A failed quote sends NO funds, so this cannot strand.
       try {
         ticket = await resolveOne("cantex");
+        if (cantexTokenSell) {
+          note(
+            "warn",
+            `Cantex has left token sells unaccepted: if it does not take this ${intent.inCanon}, it stays locked in the offer ` +
+              `until the offer expires and claim returns it`
+          );
+        }
       } catch (e) {
         if (opts.venueExplicit) throw e;
         note(
@@ -329,17 +367,14 @@ export async function resolveSwapTicket(
     ticket = await resolveOne("tradecraft");
   }
 
-  // Advisory min-input warning for Tradecraft (mirrors its web app; not a hard
-  // limit — the pool returns the funds if a small trade will not fill).
-  if (ticket.venue === "tradecraft") {
-    const minIn = tradecraftMinInput(intent.inCanon);
-    if (minIn !== undefined && Number(amount) < minIn) {
-      note(
-        "warn",
-        `${amount} ${intent.inCanon} is below Tradecraft's advertised minimum of ${minIn} ${intent.inCanon} — ` +
-          `the trade may be returned unfilled (no loss). Proceeding.`
-      );
-    }
+  // Reached only without a ticket (direct or auto): the pool may hand the
+  // input back unfilled, and nothing but the transaction is spent.
+  if (ticket.venue === "tradecraft" && belowTcMin) {
+    note(
+      "warn",
+      `${amount} ${intent.inCanon} is below Tradecraft's advertised minimum of ${tcMin} ${intent.inCanon}: ` +
+        `the pool may not take it, and the input then comes back or waits in an offer until it expires (claim returns it). Proceeding without a ticket.`
+    );
   }
   return { ticket, notes };
 }
@@ -356,7 +391,9 @@ export async function resolveSwapTicket(
 export function swapFloorNotes(
   ticket: SwapTicket,
   slippagePct: number,
-  outCanon: string
+  outCanon: string,
+  /** False for a direct or auto swap, which builds its own ticket. */
+  bought = true
 ): SwapNote[] {
   if (ticket.venue === "cantex") {
     return [
@@ -375,9 +412,10 @@ export function swapFloorNotes(
   return [
     {
       level: "warn",
-      text:
-        "no slippage protection on this ticket — filling at market price " +
-        "(the swap endpoint set no memo key)",
+      text: bought
+        ? "no slippage protection on this ticket — filling at market price (the swap endpoint set no memo key)"
+        : "no slippage protection on this swap — a direct or auto swap fills at market price unless " +
+          "CANTON_AGENT_TRADECRAFT_MEMO_KEY is set",
     },
   ];
 }

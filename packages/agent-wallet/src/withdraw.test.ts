@@ -13,8 +13,14 @@ const USDCx = KNOWN_INSTRUMENTS.USDCx!;
 // Faithful honest prepared-tx so verify-before-sign passes (real field numbers).
 import { buildHonest } from "./_prepared-fixture.js";
 
-function prepared(sender: string, receiver: string, amount: string, contractId: string): string {
-  return buildHonest({ sender, receiver, amount }, { contractId });
+function prepared(
+  sender: string,
+  receiver: string,
+  amount: string,
+  contractId: string,
+  tail?: Parameters<typeof buildHonest>[1]["tail"]
+): string {
+  return buildHonest({ sender, receiver, amount }, { contractId, ...(tail ? { tail } : {}) });
 }
 /** Deterministic stand-in for Canton's V2 hash (see verify-prepared.ts). */
 function RECOMPUTE(b64: string): string {
@@ -56,7 +62,7 @@ function stub(receiver: string): void {
         const b = JSON.parse(init.body ?? "{}");
         const cmd = b.commands[0].ExerciseCommand;
         const ex = cmd.choiceArgument.transfer;
-        const pt = prepared(ex.sender, ex.receiver, ex.amount, cmd.contractId);
+        const pt = prepared(ex.sender, ex.receiver, ex.amount, cmd.contractId, ex);
         // Honest relay: hash OF the prepared bytes so the binding accepts it.
         return new Response(JSON.stringify({ preparedTransaction: pt, hash: RECOMPUTE(pt) }), { status: 200 });
       }

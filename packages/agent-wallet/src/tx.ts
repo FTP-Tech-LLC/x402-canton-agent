@@ -7,7 +7,7 @@
  */
 import { signHashB64 } from "./keys.js";
 import { resolveHashBinding } from "./hash-binding.js";
-import type { PendingResult, RelayClient } from "./relay-client.js";
+import { RelayHttpError, type OutgoingResult, type PendingResult, type RelayClient } from "./relay-client.js";
 import type { AgentWallet } from "./store.js";
 import {
   assertHashBinding,
@@ -16,6 +16,7 @@ import {
   assertPreparedRegistrySelfPreapproval,
   PreparedTransferMismatchError,
   assertPreparedAcceptMatches,
+  assertPreparedWithdrawMatches,
   assertPreparedTcCreateBatcher,
   assertPreparedTcCreateAllocation,
   assertPreparedTcFundAllocation,
@@ -31,6 +32,7 @@ import {
   type HashBindingOptions,
   type PreparedTransferExpectation,
   type PreparedAcceptExpectation,
+  type PreparedWithdrawExpectation,
   PreparedDecodeError,
   PreparedHashUnavailableError,
 } from "./verify-prepared.js";
@@ -52,6 +54,42 @@ const TI_IFACE =
  */
 const EXPECTED_INSTRUMENT_ID = "Amulet";
 
+/**
+ * The template the root `TransferFactory_Transfer` runs on, by family: also
+ * CALLER INTENT. The choice is an interface choice, so its name says nothing
+ * about the code that runs. Read off the MainNet captures in src/__fixtures__:
+ * Canton Coin roots on the DSO's ExternalPartyAmuletRules; a DA Registry
+ * Utility token on the receiver's TransferPreapproval when it settles direct,
+ * on the AllocationFactory for an offer to a pool or a self-merge. A look-alike
+ * package can reuse these names, which is why core also binds what the
+ * delivery consequence pays to the root.
+ */
+const AMULET_FACTORY_TEMPLATE = "Splice.ExternalPartyAmuletRules:ExternalPartyAmuletRules";
+const REGISTRY_FACTORY_TEMPLATES: readonly string[] = [
+  "Utility.Registry.App.V0.Model.TransferPreapproval:TransferPreapproval",
+  "Utility.Registry.App.V0.Service.AllocationFactory:AllocationFactory",
+];
+
+function factoryTemplates(registryInstrument: boolean | undefined): string | readonly string[] {
+  return registryInstrument === true ? REGISTRY_FACTORY_TEMPLATES : AMULET_FACTORY_TEMPLATE;
+}
+
+/** Core's `dsoParty`: on the Canton Coin path the admin this wallet pins IS
+ *  its trusted DSO (relay-signer's trustedDso, withdraw's and merge's
+ *  resolveTrustedDsoParty), so core pins the root to it. A registry token is
+ *  not Canton Coin even when its id is "Amulet". */
+function cantonCoinDso(
+  registryInstrument: boolean | undefined,
+  admin: string | undefined
+): { dsoParty: string } | Record<string, never> {
+  return registryInstrument !== true && admin !== undefined ? { dsoParty: admin } : {};
+}
+
+/** Slack on the deadline transfer() writes into its own command. An honest
+ *  relay forwards it unchanged; up to a minute later only extends how long an
+ *  input nobody takes stays locked. */
+const EXECUTE_BEFORE_SLACK_MS = 60_000;
+
 function rid(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -69,6 +107,7 @@ function rid(prefix: string): string {
 type VerifySpec =
   | { kind: "cip56"; expect: PreparedTransferExpectation }
   | { kind: "accept"; expect: PreparedAcceptExpectation }
+  | { kind: "withdraw"; expect: PreparedWithdrawExpectation }
   | TradecraftVerifySpec;
 
 /** The Tradecraft queued-mode shapes (see core prepared-transfer.ts). */
@@ -140,6 +179,11 @@ async function prepareSignExecute(
       // claim path: structurally prove the prepared tx is a single inbound
       // TransferInstruction_Accept by the agent, not an outbound drain.
       assertPreparedAcceptMatches(preparedTransaction, verify.expect);
+      break;
+    case "withdraw":
+      // reclaim path: the agent withdrawing its own registry offer, the value
+      // coming back to it — never anything else under its signature.
+      assertPreparedWithdrawMatches(preparedTransaction, verify.expect);
       break;
     case "tcBatcher":
       assertPreparedTcCreateBatcher(preparedTransaction, verify.expect);
@@ -317,6 +361,8 @@ export async function transfer(
       : {}),
   });
   const now = Date.now();
+  const executeBeforeMs = now + 600_000;
+  const meta = opts.meta ?? {};
   const ex = {
     ExerciseCommand: {
       templateId: f.transferFactoryTemplateId,
@@ -330,9 +376,9 @@ export async function transfer(
           amount: opts.amount,
           instrumentId: f.instrumentId,
           requestedAt: new Date(now - 2000).toISOString(),
-          executeBefore: new Date(now + 600_000).toISOString(),
+          executeBefore: new Date(executeBeforeMs).toISOString(),
           inputHoldingCids,
-          meta: { values: opts.meta ?? {} },
+          meta: { values: meta },
         },
         extraArgs: { context: f.choiceContextData, meta: { values: {} } },
       },
@@ -356,6 +402,14 @@ export async function transfer(
         // exercise against another (resolve→prepare TOCTOU). Defense-in-depth on
         // top of the all-nodes party backstop.
         expectedContractId: f.factoryId,
+        // That contract's template: the cid is the relay's answer, the
+        // template family is ours.
+        templateQualifiedName: factoryTemplates(opts.registryInstrument),
+        ...cantonCoinDso(opts.registryInstrument, opts.expectInstrumentAdmin),
+        // The rest of the command is ours too: the meta a swap's venue reads
+        // its terms from (floor, buy token) and the deadline we set.
+        meta,
+        executeBeforeMaxMs: executeBeforeMs + EXECUTE_BEFORE_SLACK_MS,
         // Optional caller-intent pins (off by default — the agent has no out-of-
         // band DSO/domain in the base CC flow): the SIGNED synchronizer_id and
         // the instrument admin (DSO). When supplied they close the relay-chosen-
@@ -470,6 +524,9 @@ export async function payViaTransferFactory(
     receiver: opts.receiver,
     amount: opts.amount,
     instrumentId: opts.expectInstrumentId ?? EXPECTED_INSTRUMENT_ID,
+    // The root's template by family; core binds the delivery to the root.
+    templateQualifiedName: factoryTemplates(opts.registryInstrument),
+    ...cantonCoinDso(opts.registryInstrument, opts.expectInstrumentAdmin),
     ...(opts.expectInstrumentAdmin !== undefined
       ? { instrumentAdmin: opts.expectInstrumentAdmin }
       : {}),
@@ -671,15 +728,18 @@ export async function claimAll(
             selfParty: wallet.party,
             nowMs: Date.now(),
             // A registry claim DECLARES its token: that is what admits the
-            // registry two-step accept node, and the created holding is then
-            // held to {agent, registrar, trusted registry parties}. A Canton
-            // Coin claim declares nothing and keeps the Amulet-only whitelist.
+            // registry two-step accept node, and the offer and the created
+            // holding are then held to the registrar. A Canton Coin claim keeps
+            // the Amulet-only whitelist and, when the network's DSO is known,
+            // is held to it (the instruction the DSO signed must pay the agent).
             ...(registryAdmin !== undefined
               ? {
                   instrumentAdmin: registryAdmin,
                   trustedRegistryParties: resolveTrustedRegistryParties(registryAdmin, process.env),
                 }
-              : {}),
+              : trustedDso !== undefined
+                ? { dsoParty: trustedDso }
+                : {}),
           },
         },
         hashBinding
@@ -709,6 +769,119 @@ export async function claimAll(
   // `claimed` is what actually landed, not what was pending — the old value
   // reported every row as claimed even when the call had thrown.
   return { claimed: updateIds.length, updateIds, skippedExpired, failed, skippedUntrusted };
+}
+
+/** The status of a registry offer still waiting on its receiver. */
+const PENDING_RECEIVER_ACCEPTANCE = "TransferPendingReceiverAcceptance";
+/** How long past executeBefore an offer must be before it is withdrawn, so a
+ *  clock a little ahead of the ledger's never races a receiver's last accept. */
+const RECLAIM_MARGIN_MS = 60_000;
+
+/**
+ * Withdraw this wallet's own registry offers that the receiver never took and
+ * can no longer take (executeBefore has passed). Until withdrawn, such an offer
+ * keeps its input locked: a swap venue that left a token sell untaken (MainNet,
+ * 24.10) stranded the input there, visible in the balance and unspendable.
+ *
+ * Only offers a minute past their executeBefore are withdrawn, so the receiver
+ * cannot be racing to accept one. The relay's row only nominates: each withdraw
+ * is verified before signing (`kind: "withdraw"`) against the signed bytes —
+ * the offer is the registrar's, sent by the agent, its executeBefore past, and
+ * the value comes back to the agent. A verify refusal stops the run (evidence
+ * about the relay, as in claimAll); a ledger failure is recorded and the
+ * others still go.
+ *
+ * A relay that predates `/outgoing` answers 404: `supported: false`, nothing done.
+ */
+export async function reclaimExpiredOffers(
+  relay: RelayClient,
+  wallet: AgentWallet,
+  opts: { hashBinding?: HashBindingOptions; nowMs?: number } = {}
+): Promise<{
+  supported: boolean;
+  reclaimed: Array<{ cid: string; amount?: string; instrument: string; updateId: string }>;
+  /** Offers still inside their window: the receiver may yet take them. */
+  waiting: Array<{ cid: string; amount?: string; instrument: string; executeBefore?: string }>;
+  failed: Array<{ cid: string; error: string }>;
+  /** Offers of a token whose registrar this wallet has no trust anchor for:
+   *  their withdraw cannot be verified, so they are left alone. */
+  skippedUntrusted: Array<{ cid: string; admin: string }>;
+}> {
+  const hashBinding = opts.hashBinding ?? resolveHashBinding();
+  const result = {
+    supported: true,
+    reclaimed: [] as Array<{ cid: string; amount?: string; instrument: string; updateId: string }>,
+    waiting: [] as Array<{ cid: string; amount?: string; instrument: string; executeBefore?: string }>,
+    failed: [] as Array<{ cid: string; error: string }>,
+    skippedUntrusted: [] as Array<{ cid: string; admin: string }>,
+  };
+  let rows: OutgoingResult["outgoing"];
+  try {
+    rows = (await relay.outgoing(wallet.party)).outgoing;
+  } catch (err) {
+    if (err instanceof RelayHttpError && err.status === 404) return { ...result, supported: false };
+    throw err;
+  }
+  const nowMs = opts.nowMs ?? Date.now();
+  for (const o of rows) {
+    if (o.status !== undefined && o.status !== PENDING_RECEIVER_ACCEPTANCE) continue;
+    const instrument = o.instrumentId.id;
+    const amount = o.amount !== undefined ? { amount: o.amount } : {};
+    // An unreadable deadline is not "expired": it waits, never withdrawn on a NaN.
+    const deadline = o.executeBefore === undefined ? NaN : Date.parse(o.executeBefore);
+    if (!Number.isFinite(deadline) || deadline + RECLAIM_MARGIN_MS > nowMs) {
+      result.waiting.push({ cid: o.cid, instrument, ...amount, ...(o.executeBefore ? { executeBefore: o.executeBefore } : {}) });
+      continue;
+    }
+    const admin = o.instrumentId.admin;
+    if (!isTrustedRegistryAdmin(admin, process.env)) {
+      result.skippedUntrusted.push({ cid: o.cid, admin });
+      continue;
+    }
+    try {
+      const ctx = await relay.resolveWithdraw({ instructionCid: o.cid, instrumentAdmin: admin });
+      const ex = {
+        ExerciseCommand: {
+          templateId: TI_IFACE,
+          contractId: o.cid,
+          choice: "TransferInstruction_Withdraw",
+          choiceArgument: {
+            extraArgs: { context: ctx.choiceContextData, meta: { values: {} } },
+          },
+        },
+      };
+      const updateId = await prepareSignExecute(
+        relay,
+        wallet,
+        [ex],
+        ctx.disclosedContracts,
+        {
+          kind: "withdraw",
+          expect: {
+            selfParty: wallet.party,
+            instructionCid: o.cid,
+            instrumentAdmin: admin,
+            trustedRegistryParties: resolveTrustedRegistryParties(admin, process.env),
+            // The SIGNED executeBefore, not the relay's row, decides.
+            onlyIfExpiredAt: nowMs - RECLAIM_MARGIN_MS,
+            nowMs: Date.now(),
+          },
+        },
+        hashBinding
+      );
+      result.reclaimed.push({ cid: o.cid, instrument, ...amount, updateId });
+    } catch (err) {
+      if (
+        err instanceof PreparedTransferMismatchError ||
+        err instanceof PreparedDecodeError ||
+        err instanceof PreparedHashUnavailableError
+      ) {
+        throw err;
+      }
+      result.failed.push({ cid: o.cid, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+  return result;
 }
 
 /**

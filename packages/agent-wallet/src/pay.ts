@@ -34,14 +34,15 @@ export interface PayOpts extends EnsureWalletOpts {
    * See HashBindingOptions / verify-prepared.ts.
    */
   hashBinding?: HashBindingOptions;
-  /** Max on-ledger re-pay attempts on a PERSISTING 402 (passed to
-   *  wrapFetchWithCantonPayment; default 4). A custodial/proxy payer should set
-   *  1 so one logical pay mints at most one extra Create, bounding gas burn if a
-   *  merchant keeps returning 402. */
+  /** Retries of a network error while building the payment, before it is signed. Default 4. */
   maxPaymentRetries?: number;
+  /** Re-sends of the same signed payment when the paid request is answered 5xx
+   *  (the client's `paidResends`). Default 2; 0 disables. */
+  paidResends?: number;
   /** Optional spend ceiling threaded into the relay signer: the MAX amount the
-   *  signer will EVER sign for (same unit the 402 quotes). When set, the autopay
-   *  REFUSES — fail closed, before any relay call — to sign a merchant-quoted
+   *  signer will EVER sign for, as a Canton Coin decimal (e.g. "0.05"; the 402
+   *  itself quotes atomic units). When set, the autopay REFUSES (fail closed,
+   *  before any relay call) to sign a merchant-quoted
    *  amount above it, so an over-quoting (or MITM'd) merchant can never get the
    *  agent to sign a charge larger than the caller authorized. Omitted → no
    *  ceiling (the published MCP/pay path is unaffected when unset). */
@@ -66,6 +67,24 @@ export interface PayOpts extends EnsureWalletOpts {
    * preferred-but-unconsented asset fails closed with the usual consent error.
    */
   preferAsset?: string;
+  /**
+   * The asset to pay in when the caller named none: this one when the 402
+   * offers it, else the first compatible entry as before. Never fails on its
+   * own. The MCP `pay` passes "CC", so an API that lists a token first is paid
+   * in Canton Coin instead of refused for a token this wallet may not spend.
+   * Ignored when `preferAsset` is set.
+   */
+  defaultAsset?: string;
+  /**
+   * Registry instruments this payment MAY be made in, as `"<admin>|<id>"`:
+   * the consent `preferAsset` deliberately is not. Forwarded to the relay
+   * signer; omitted → `CANTON_AGENT_PAYABLE_INSTRUMENTS` alone decides, as
+   * before. Canton Coin needs no entry.
+   */
+  payableInstruments?: readonly string[];
+  /** Forwarded to the relay signer: called for every transfer it signs
+   *  (see makeRelaySigner `onSigned`). */
+  onSigned?: (signed: { instrument: string; amount: string }) => void;
 }
 
 /**
@@ -81,7 +100,8 @@ export interface PayOpts extends EnsureWalletOpts {
  * @returns A selector over the compatible candidates, or undefined.
  */
 export function buildPreferAssetSelector(
-  preferAsset: string | undefined
+  preferAsset: string | undefined,
+  opts: { fallBackToFirst?: boolean } = {}
 ): ((cands: PaymentRequirements[]) => PaymentRequirements) | undefined {
   if (!preferAsset) return undefined;
   const want = preferAsset.toLowerCase();
@@ -124,6 +144,8 @@ export function buildPreferAssetSelector(
   return (cands: PaymentRequirements[]): PaymentRequirements => {
     const hit = cands.find(exact) ?? cands.find(matches);
     if (hit) return hit;
+    // A default, not a choice: without it, the first entry as before.
+    if (opts.fallBackToFirst && cands[0]) return cands[0];
     const offered = [
       ...new Set(cands.map((a) => a.extra?.instrumentId?.id ?? a.asset)),
     ].join(", ");
@@ -132,6 +154,19 @@ export function buildPreferAssetSelector(
         `Pass one of those, or drop --asset to pay the first offered entry.`
     );
   };
+}
+
+/**
+ * The accepts[] tiebreaker a paying fetch and a peek share: the preferred
+ * asset when set (fails closed when not offered); else the default asset when
+ * offered; else none (the first compatible entry).
+ */
+function assetSelector(
+  opts: Pick<PayOpts, "preferAsset" | "defaultAsset">
+): ((cands: PaymentRequirements[]) => PaymentRequirements) | undefined {
+  return opts.preferAsset !== undefined
+    ? buildPreferAssetSelector(opts.preferAsset)
+    : buildPreferAssetSelector(opts.defaultAsset, { fallBackToFirst: true });
 }
 
 /**
@@ -151,7 +186,7 @@ export function buildPreferAssetSelector(
 export function peekWalletPayment(
   response: Response,
   wallet: AgentWallet,
-  opts: Pick<PayOpts, "preferAsset"> = {}
+  opts: Pick<PayOpts, "preferAsset" | "defaultAsset"> = {}
 ):
   | {
       payTo: string;
@@ -159,7 +194,7 @@ export function peekWalletPayment(
       registryInstrument?: { admin: string; id: string };
     }
   | undefined {
-  const selectRequirements = buildPreferAssetSelector(opts.preferAsset);
+  const selectRequirements = assetSelector(opts);
   let chosen: PaymentRequirements | undefined;
   try {
     chosen = peekChosenRequirement(
@@ -197,6 +232,23 @@ export async function makePayingFetch(
   return makePayingFetchForWallet(wallet, opts, walletDir());
 }
 
+/** The User-Agent a paid request carries when the caller sets none. Node's
+ *  `fetch` sends `node`, and some APIs refuse that outright: Tradecraft's API
+ *  answers 403 to `node` or to no User-Agent before it ever sends its 402
+ *  (measured 2026-11-03). */
+export const PAY_USER_AGENT = "canton-agent-wallet";
+
+/** `fetch` that adds PAY_USER_AGENT when the request carries no User-Agent of
+ *  its own; a caller's User-Agent is never replaced. */
+export function withDefaultUserAgent(base: typeof globalThis.fetch): typeof globalThis.fetch {
+  return (input, init) => {
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    if (headers.has("user-agent")) return base(input, init);
+    headers.set("user-agent", PAY_USER_AGENT);
+    return base(input, { ...init, headers });
+  };
+}
+
 /**
  * Like makePayingFetch but for a wallet OBJECT you already hold — a wallet
  * reconstructed in memory (`ensureWallet({ ephemeral: true })`, or a key a hosted
@@ -212,10 +264,14 @@ export async function makePayingFetchForWallet(
     | "apiKey"
     | "hashBinding"
     | "maxPaymentRetries"
+    | "paidResends"
     | "maxPaymentValue"
     | "maxPaymentValueByInstrument"
     | "expectedPayTo"
     | "preferAsset"
+    | "defaultAsset"
+    | "payableInstruments"
+    | "onSigned"
   >,
   lockHome?: string
 ): Promise<typeof globalThis.fetch> {
@@ -231,14 +287,20 @@ export async function makePayingFetchForWallet(
     ...(opts.expectedPayTo !== undefined
       ? { expectedPayTo: opts.expectedPayTo }
       : {}),
+    ...(opts.payableInstruments !== undefined
+      ? { payableInstruments: opts.payableInstruments }
+      : {}),
+    ...(opts.onSigned !== undefined ? { onSigned: opts.onSigned } : {}),
   });
-  // When a preferred asset is set, pick the matching accepts[] entry; else the
-  // first compatible entry — identical to the default when no preference is given.
-  const selectRequirements = buildPreferAssetSelector(opts.preferAsset);
-  const paying = wrapFetchWithCantonPayment(globalThis.fetch, signer, {
+  const selectRequirements = assetSelector(opts);
+  // Both the probe and the paid retry go out with a User-Agent (the retry
+  // keeps the caller's headers and goes through this same fetch).
+  const fetchUa: typeof globalThis.fetch = (input, init) => withDefaultUserAgent(globalThis.fetch)(input, init);
+  const paying = wrapFetchWithCantonPayment(fetchUa, signer, {
     ...(opts.maxPaymentRetries !== undefined
       ? { maxPaymentRetries: opts.maxPaymentRetries }
       : {}),
+    ...(opts.paidResends !== undefined ? { paidResends: opts.paidResends } : {}),
     ...(selectRequirements ? { selectRequirements } : {}),
   });
 
@@ -255,7 +317,9 @@ export async function makePayingFetchForWallet(
   // non-402-shaped/unparseable challenge) falls through to serialize as a
   // fail-safe.
   return async function payingFetch(input, init) {
-    const probe = await globalThis.fetch(input, init);
+    // Probe on a copy of a Request: the probe reads its body, and the pay
+    // below must still send it (it failed before signing, measured).
+    const probe = await fetchUa(input instanceof Request ? input.clone() : input, init);
     if (probe.status !== 402) return probe;
     if (lockHome === undefined) return paying(input, init);
     // The peek must run the SAME selection as the paying fetch — including the
