@@ -155,7 +155,7 @@ describe("resolveSwapTicket — venue routing", () => {
     expect(h.notes[0]?.text).toContain("CANTON_AGENT_DSO_PARTY");
   });
 
-  it("tradecraft: Tradecraft only, and the advisory minimum is a warning, not a block", async () => {
+  it("tradecraft direct: below the minimum it warns and tries, as no fee is paid", async () => {
     const h = harness({});
     const r = await resolveSwapTicket({ ...base, amount: "5", venue: "tradecraft", venueExplicit: true, direct: true, deps: h.deps, onNote: h.onNote });
     expect(r.ticket.venue).toBe("tradecraft");
@@ -163,9 +163,18 @@ describe("resolveSwapTicket — venue routing", () => {
     expect(h.notes).toEqual([
       {
         level: "warn",
-        text: "5 CC is below Tradecraft's advertised minimum of 6 CC — the trade may be returned unfilled (no loss). Proceeding.",
+        text: "5 CC is below Tradecraft's advertised minimum of 6 CC: the pool may not take it, and the input then comes back or waits in an offer until it expires (claim returns it). Proceeding without a ticket.",
       },
     ]);
+  });
+
+  it("tradecraft with a ticket: below the minimum it refuses before buying (MainNet, 2026-11-04: 0.629 USDXLR came back, 0.01 CC lost)", async () => {
+    const h = harness({});
+    await expect(
+      resolveSwapTicket({ ...base, amount: "5", venue: "tradecraft", venueExplicit: true, direct: false, deps: h.deps, payingFetch: h.payingFetch, onNote: h.onNote })
+    ).rejects.toThrow(/below Tradecraft's advertised minimum of 6 CC.*Nothing was paid\. To try anyway without a ticket, swap direct/);
+    expect(h.payingFetch).not.toHaveBeenCalled();
+    expect(h.deps.fetchTicketFromEndpoint).not.toHaveBeenCalled();
   });
 
   it("auto: free direct quotes from every eligible venue, best output wins, and the endpoint is never paid", async () => {
@@ -203,6 +212,57 @@ describe("resolveSwapTicket — venue routing", () => {
   it("auto skips Cantex for a CC input under its minimum", async () => {
     const h = harness({});
     const r = await resolveSwapTicket({ ...base, amount: "10", venue: "auto", venueExplicit: true, direct: true, deps: h.deps });
+    expect(r.ticket.venue).toBe("tradecraft");
+    expect(h.deps.buildCantexTicket).not.toHaveBeenCalled();
+  });
+
+  it("default (cantex, not explicit): a token input routes to Tradecraft with a warning — Cantex is not asked", async () => {
+    const h = harness({});
+    const r = await resolveSwapTicket({
+      ...base,
+      intent: resolveSwapIntent("USDCx", "CC"),
+      amount: "5",
+      venue: "cantex",
+      venueExplicit: false,
+      direct: true,
+      deps: h.deps,
+      onNote: h.onNote,
+    });
+    expect(r.ticket.venue).toBe("tradecraft");
+    expect(h.deps.buildCantexTicket).not.toHaveBeenCalled();
+    expect(h.notes[0]).toEqual({
+      level: "warn",
+      text: "Cantex has left token sells unaccepted; routing USDCx to Tradecraft (name the cantex venue to use it anyway)",
+    });
+  });
+
+  it("explicit cantex with a token input still uses Cantex, and says the input may stay locked in the offer", async () => {
+    const h = harness({});
+    const r = await resolveSwapTicket({
+      ...base,
+      intent: resolveSwapIntent("USDCx", "CC"),
+      amount: "5",
+      venue: "cantex",
+      venueExplicit: true,
+      direct: true,
+      deps: h.deps,
+      onNote: h.onNote,
+    });
+    expect(r.ticket.venue).toBe("cantex");
+    expect(h.notes.map((n) => n.text).join("\n")).toMatch(/stays locked in the offer until the offer expires and claim returns it/);
+  });
+
+  it("auto does not quote Cantex for a token input", async () => {
+    const h = harness({});
+    const r = await resolveSwapTicket({
+      ...base,
+      intent: resolveSwapIntent("USDCx", "CC"),
+      amount: "5",
+      venue: "auto",
+      venueExplicit: true,
+      direct: true,
+      deps: h.deps,
+    });
     expect(r.ticket.venue).toBe("tradecraft");
     expect(h.deps.buildCantexTicket).not.toHaveBeenCalled();
   });
@@ -282,5 +342,14 @@ describe("swapFloorNotes — what bounds the fill is always said", () => {
     expect(n).toHaveLength(1);
     expect(n[0]!.level).toBe("warn");
     expect(n[0]!.text).toMatch(/^no slippage protection on this ticket/);
+  });
+  it("a direct or auto swap without a memo key names the setting, not the endpoint", () => {
+    const n = swapFloorNotes(tradecraftTicket("59", false), 1, "USDCx", false);
+    expect(n).toEqual([
+      {
+        level: "warn",
+        text: "no slippage protection on this swap — a direct or auto swap fills at market price unless CANTON_AGENT_TRADECRAFT_MEMO_KEY is set",
+      },
+    ]);
   });
 });

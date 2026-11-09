@@ -8,12 +8,16 @@ import {
   resolveRelayUrl,
   DEFAULT_NETWORK,
   MISSING_RELAY_HELP,
+  relayUnreachable,
   withdrawAmount,
+  withdrawArgsError,
   preapprovalMode,
   payLimits,
   preapprovalInstrumentId,
+  amuletPreapprovalPlan,
 } from "./cli-args.js";
 import { KNOWN_INSTRUMENTS, instrumentKey } from "./registry-parties.js";
+import { RelayHttpError, RelayOutcomeUnknownError } from "./relay-client.js";
 
 describe("cli-args.flag", () => {
   it("returns the value after the flag", () => {
@@ -248,6 +252,38 @@ describe("withdrawAmount — present-but-empty is not absent", () => {
   });
 });
 
+describe("withdrawArgsError: an ignored argument is not a full sweep", () => {
+  it("an amount given positionally is refused, not dropped", () => {
+    // Without --amount withdraw sends the FULL balance, so a dropped "5" swept it.
+    const msg = withdrawArgsError(["--to", "bob::1220aa", "5"]);
+    expect(msg).toMatch(/unexpected argument "5"/);
+    expect(msg).toMatch(/--amount <n>/);
+  });
+
+  it("a misspelled amount flag is refused", () => {
+    expect(withdrawArgsError(["--to", "bob::1220aa", "--amt", "5"])).toMatch(/unknown option --amt/);
+    expect(withdrawArgsError(["--to", "bob::1220aa", "--ammount", "5"])).toMatch(/unknown option --ammount/);
+    expect(withdrawArgsError(["--to", "bob::1220aa", "--amt=5"])).toMatch(/unknown option --amt\b/);
+  });
+
+  it("every option withdraw reads passes, in either spelling", () => {
+    expect(withdrawArgsError(["--to", "bob::1220aa"])).toBeUndefined();
+    expect(withdrawArgsError(["--to", "bob::1220aa", "--amount", "5"])).toBeUndefined();
+    expect(withdrawArgsError(["--amount=5", "--to=bob::1220aa"])).toBeUndefined();
+    expect(
+      withdrawArgsError([
+        "--to", "bob::1220aa", "--amount", "0.5", "--admin", "reg::1220bb",
+        "--id", "USDCx", "--relay-url", "http://relay",
+      ])
+    ).toBeUndefined();
+  });
+
+  it("a flag value is not mistaken for a positional", () => {
+    // "-5" after --amount is that flag's value; withdraw() judges it.
+    expect(withdrawArgsError(["--to", "bob::1220aa", "--amount", "-5"])).toBeUndefined();
+  });
+});
+
 /**
  * The documented default of `preapproval` is SELF-provision. The mode used to be
  * switched by `CANTON_X402_OPERATOR_TOKEN` in the ambient environment — a name
@@ -386,5 +422,63 @@ describe("preapproval --id for a registry token", () => {
     expect(preapprovalInstrumentId([], "someone::1220")).toBeUndefined();
     // ember-silver and ember-gold share a namespace but are distinct admins; each still resolves.
     expect(preapprovalInstrumentId([], KNOWN_INSTRUMENTS.eXAG!.admin)).toBe("eXAG");
+  });
+});
+
+describe("relayUnreachable: the reachability hint is for a relay that never answered", () => {
+  it("a relay 502 whose body says 'fetch failed' does not get it", () => {
+    // The relay WAS reached; that "fetch failed" is its own hop to the participant.
+    const body = '{"error":"wallet relay pay/prepare failed","detail":"fetch failed"}';
+    const e = new RelayHttpError(`relay POST /v1/wallet/pay/prepare -> 502 ${body}`, 502, JSON.parse(body));
+    expect(relayUnreachable(e, e.message)).toBe(false);
+  });
+
+  it("a submission whose outcome is unknown does not get it", () => {
+    const cause = new TypeError("fetch failed", { cause: new Error("other side closed") });
+    const e = new RelayOutcomeUnknownError("POST", "/v1/wallet/submit/execute", cause);
+    expect(relayUnreachable(e, `${e.message} ${cause.message}`)).toBe(false);
+  });
+
+  it("a connection that never opened gets it", () => {
+    const e = new TypeError("fetch failed");
+    expect(relayUnreachable(e, `${e.message} connect ECONNREFUSED 127.0.0.1:1`)).toBe(true);
+  });
+
+  it("a payment the x402 client could not confirm does not get it, however wrapped", () => {
+    // `pay`'s paid request failing in transit: its "fetch failed" is the hop to
+    // the merchant, after the payment was signed.
+    const reset = new TypeError("fetch failed", { cause: new Error("read ECONNRESET") });
+    const unconfirmed = Object.assign(new Error("the paid request failed in transit", { cause: reset }), {
+      code: "PAYMENT_UNCONFIRMED",
+    });
+    expect(relayUnreachable(unconfirmed, `${unconfirmed.message} ${reset.message}`)).toBe(false);
+    const wrapped = new Error("pay failed", { cause: unconfirmed });
+    expect(relayUnreachable(wrapped, `${wrapped.message} ${reset.message}`)).toBe(false);
+    expect(relayUnreachable(reset, reset.message)).toBe(true);
+  });
+
+  it("walks a looping cause chain a bounded number of steps", () => {
+    const e: Error & { cause?: unknown } = new TypeError("fetch failed");
+    e.cause = e;
+    expect(relayUnreachable(e, e.message)).toBe(true);
+  });
+});
+
+describe("amuletPreapprovalPlan: a create needs proof there is none", () => {
+  // Each create prepays a new fee and leaves another live contract, so only a
+  // status that was actually read may lead to one; --force is the operator
+  // saying it on purpose.
+  it("an unknown status (null) refuses without --force", () => {
+    expect(amuletPreapprovalPlan({ hasPreapproval: null }, false)).toBe("refuse-unknown");
+    expect(amuletPreapprovalPlan({ hasPreapproval: null }, true)).toBe("create");
+  });
+  it("a live preapproval is left alone unless forced", () => {
+    expect(amuletPreapprovalPlan({ hasPreapproval: true, expiresAt: "2099-01-01T00:00:00Z" }, false)).toBe("skip");
+    expect(amuletPreapprovalPlan({ hasPreapproval: true }, true)).toBe("create");
+  });
+  it("none, or expired, is created", () => {
+    expect(amuletPreapprovalPlan({ hasPreapproval: false }, false)).toBe("create");
+    expect(amuletPreapprovalPlan({ hasPreapproval: false, expired: true }, false)).toBe("create");
+    expect(amuletPreapprovalPlan({ hasPreapproval: true, expired: true }, false)).toBe("create");
   });
 });

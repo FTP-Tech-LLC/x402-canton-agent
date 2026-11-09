@@ -5,7 +5,8 @@
  *   create  [--relay-url <url>]  generate + onboard a self-custody wallet (idempotent)
  *   address                      print the party id (fund this)
  *   balance                      print every instrument the wallet holds (CC + registry tokens)
- *   claim                        accept incoming transfers (e.g. the initial funding)
+ *   claim                        accept incoming transfers (e.g. the initial funding), and take
+ *                                back this wallet's own expired offers the receiver never took
  *   merge [--target <n>] [--batch <n>] [--max-rounds <n>] [--dry-run] [--yes] [--admin <registrar> --id <instrument> | --all-tokens]
  *                                consolidate dust amulets (self-transfer in batches)
  *                                so a wallet with thousands of holdings can be
@@ -24,7 +25,7 @@
  *                                several, else the first compatible entry
  *   withdraw --to <p>            send CC back out (--amount <cc> for a partial amount)
  *   swap --in <SYM> --out <SYM> --amount <n> [--venue cantex|tradecraft|auto] [--slippage <pct>] [--direct] [--no-wait]
- *                                swap on Cantex (default) or Tradecraft: pre-approve the output, send
+ *                                swap on Cantex (default for a CC input) or Tradecraft (default for a token input): pre-approve the output, send
  *                                the input to the pool, and WAIT until the output
  *                                lands (no manual claim). By DEFAULT the ticket (pool,
  *                                minimum, amm_cid) comes from our x402 swap endpoint (a
@@ -33,15 +34,16 @@
  *                                the ticket locally from Tradecraft with no fee (a
  *                                best-effort snapshot). --no-wait returns as soon as the
  *                                input is sent (fire-and-forget; claim it yourself).
- *   tc setup|orders|status|withdraw --pair <A>/<B> …
+ *   tc setup|orders|status|fills|cancel|withdraw --pair <A>/<B> …
  *                                Tradecraft QUEUED mode: committed allocations + batched
  *                                orders instead of a pool-address transfer. setup creates
  *                                the batcher and one allocation per pool instrument
  *                                (--fund <SYM>=<n> funds the one you sell, or tops up an
  *                                existing one); orders queues
  *                                exact-input orders (--sell, --amounts or --amount
- *                                [--count]); status shows allocation funding and open
- *                                orders; cancel abandons pending orders (input stays in the
+ *                                [--count]); status shows allocation funding, open
+ *                                orders and fills awaiting settlement; fills lists
+ *                                orders, fills and settlement legs; cancel abandons pending orders (input stays in the
  *                                allocation); withdraw --instrument asks the venue to release
  *                                an allocation back to the wallet (whole, asynchronous).
  *   export                       print the private key (backup; guard it)
@@ -67,14 +69,21 @@
  */
 /* eslint-disable no-console -- CLI entrypoint: stdout is its result channel */
 import { readFileSync } from "node:fs";
+import { readPaymentResponseHeader } from "@ftptech/x402-canton-client";
 import { ensureWallet } from "./onboard.js";
 import type { StarterGrantResult } from "./starter-grant.js";
 import { loadWallet, saveWallet, walletPath, type AgentWallet } from "./store.js";
-import { agentKeyFromPrivatePem } from "./keys.js";
+import { agentKeyFromPrivatePem, readSignerFromWallet } from "./keys.js";
 import { makePayingFetch } from "./pay.js";
 import { RelayClient, isHoldingsExceedNodeLimitError } from "./relay-client.js";
 import {
+  PreparedDecodeError,
+  PreparedHashUnavailableError,
+  PreparedTransferMismatchError,
+} from "./verify-prepared.js";
+import {
   claimAll,
+  reclaimExpiredOffers,
   selfProvisionPreapproval,
   selfProvisionRegistryPreapproval,
 } from "./tx.js";
@@ -91,6 +100,7 @@ import {
   SWAP_MAX_FEE_CC,
   type SwapNote,
 } from "./swap-route.js";
+import { SWAP_TICKET_FEE_CC, swapNotCovered } from "./swap-cover.js";
 import { installProxyFromEnv } from "./proxy.js";
 import {
   loadTcPool,
@@ -99,6 +109,8 @@ import {
   tcStatus,
   tcWithdraw,
   tcCancel,
+  tcFills,
+  formatTcFills,
   type TcContext,
 } from "./tradecraft-queued.js";
 import {
@@ -109,10 +121,15 @@ import {
   resolveNetwork,
   resolveRelayUrl,
   MISSING_RELAY_HELP,
+  relayUnreachable,
   withdrawAmount,
+  withdrawArgsError,
   preapprovalMode,
   payLimits,
+  paidNotServed,
+  PAID_NOT_SERVED_EXIT_CODE,
   preapprovalInstrumentId,
+  amuletPreapprovalPlan,
 } from "./cli-args.js";
 import { resolveTrustedDsoParty } from "./trusted-dso.js";
 
@@ -216,7 +233,7 @@ async function main(): Promise<void> {
     case "balance": {
       const w = requireWallet();
       try {
-        const relay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY });
+        const relay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(w) });
         const b = await relay.balance(w.party);
         console.log(`${b.cc} CC  (${b.amulet} holding${b.amulet === 1 ? "" : "s"})`);
         // Then every OTHER instrument, through the HoldingV1 read. Best-effort
@@ -301,7 +318,7 @@ async function main(): Promise<void> {
       if (boolFlag(args, "--all-tokens")) {
         if (mAdmin) return fail("merge: --all-tokens merges every trusted token — drop --admin/--id");
         const res = await mergeAllRegistryHoldings(
-          new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY }),
+          new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(w) }),
           w,
           {
             ...(batch !== undefined ? { batch } : {}),
@@ -325,7 +342,7 @@ async function main(): Promise<void> {
             `CANTON_AGENT_REGISTRY_TRUSTED_PARTIES before merging its token`
         );
       }
-      const relay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY });
+      const relay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(w) });
       const res = await mergeHoldings(relay, w, {
         ...(target !== undefined ? { target } : {}),
         ...(batch !== undefined ? { batch } : {}),
@@ -356,7 +373,8 @@ async function main(): Promise<void> {
     }
     case "claim": {
       const w = requireWallet();
-      const r = await claimAll(new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY }), w);
+      const claimRelay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(w) });
+      const r = await claimAll(claimRelay, w);
       // Say what happened to EVERY pending row, not just the claimed ones. An
       // expired offer is skipped (the ledger would refuse its accept); a failed
       // one is reported by cid with the reason, and the others still land.
@@ -371,6 +389,42 @@ async function main(): Promise<void> {
       ].filter(Boolean);
       console.log(parts.join("; "));
       for (const f of r.failed) console.error(`  failed ${f.cid.slice(0, 18)}…: ${f.error}`);
+      // Then take back what this wallet SENT that the receiver never took and can
+      // no longer take (an expired offer keeps its input locked until withdrawn).
+      // The claims above stand whatever happens here; only a verify refusal
+      // (evidence about the relay) is fatal, as it is in claimAll.
+      let rc: Awaited<ReturnType<typeof reclaimExpiredOffers>>;
+      try {
+        rc = await reclaimExpiredOffers(claimRelay, w);
+      } catch (err) {
+        if (
+          err instanceof PreparedTransferMismatchError ||
+          err instanceof PreparedDecodeError ||
+          err instanceof PreparedHashUnavailableError
+        ) {
+          throw err;
+        }
+        console.error(`taking back expired offers failed: ${err instanceof Error ? err.message : String(err)}`);
+        rc = { supported: true, reclaimed: [], waiting: [], failed: [], skippedUntrusted: [] };
+      }
+      const what = (xs: Array<{ amount?: string; instrument: string }>) =>
+        xs.map((x) => `${x.amount ?? "?"} ${x.instrument}`).join(", ");
+      if (rc.reclaimed.length) {
+        console.log(`returned ${rc.reclaimed.length} expired offer(s) the receiver never took: ${what(rc.reclaimed)}`);
+      }
+      if (rc.waiting.length) {
+        console.log(
+          `${rc.waiting.length} offer(s) still waiting on the receiver: ${what(rc.waiting)} ` +
+            `(claim again after ${rc.waiting.map((x) => x.executeBefore ?? "?").join(", ")} to take back any it does not take)`
+        );
+      }
+      for (const f of rc.failed) console.error(`  withdraw failed ${f.cid.slice(0, 18)}…: ${f.error}`);
+      if (rc.skippedUntrusted.length) {
+        console.log(
+          `${rc.skippedUntrusted.length} expired offer(s) of a token whose registrar this wallet does not trust left locked ` +
+            `(${[...new Set(rc.skippedUntrusted.map((x) => x.admin))].join(", ")})`
+        );
+      }
       // A scripted `claim && pay` must not proceed unfunded: when every
       // attempted accept failed, say so with the exit code, not only on stderr.
       if (r.claimed === 0 && r.failed.length > 0) {
@@ -405,7 +459,7 @@ async function main(): Promise<void> {
         return fail(
           "cannot resolve the instrument admin (DSO) for this network — pass --admin <DSO party> or set CANTON_AGENT_DSO_PARTY"
         );
-      const relay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY });
+      const relay = new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(w) });
       const status = await relay.preapprovalStatus(w.party, admin);
       if (boolFlag(args, "--status")) {
         console.log(
@@ -427,8 +481,8 @@ async function main(): Promise<void> {
       // Skip only when the contract is provably still live, and let --force
       // override for the case where the relay cannot tell us.
       const force = boolFlag(args, "--force");
-      const provablyLive = status.hasPreapproval === true && status.expired !== true;
-      if (provablyLive && !force) {
+      const plan = amuletPreapprovalPlan(status, force);
+      if (plan === "skip") {
         const until = status.expiresAt ? ` (expires ${status.expiresAt})` : "";
         const blind = status.expiresAt
           ? ""
@@ -445,6 +499,16 @@ async function main(): Promise<void> {
         );
       } else if (force && status.hasPreapproval === true) {
         console.log(`--force: renewing ${w.party}'s TransferPreapproval anyway`);
+      }
+      // "Could not tell" is not "none" (see amuletPreapprovalPlan). The registry
+      // branch below keeps its own, same rule.
+      if (plan === "refuse-unknown" && !isTrustedRegistryAdmin(admin, process.env)) {
+        return fail(
+          `cannot confirm whether ${w.party} already has a TransferPreapproval ` +
+            `(the relay reported hasPreapproval: null${status.note ? `: ${status.note}` : ""}). ` +
+            `Creating one is not idempotent: it prepays another fee and leaves a second ` +
+            `live preapproval. Re-run with --force to create it anyway, or try again later.`
+        );
       }
       // Resolve the expiry: --expires-at <ISO> wins; else --days N (default 30).
       const daysFlag = Number(flag(args, "--days"));
@@ -585,6 +649,11 @@ async function main(): Promise<void> {
       // BEFORE anything is signed; see payLimits.
       const limits = payLimits(args);
       if (limits.kind === "error") return fail(limits.message);
+      // Once a payment is signed, any end but a 2xx exits
+      // PAID_NOT_SERVED_EXIT_CODE: it may have settled, so do not pay again.
+      // That includes a 5xx the client could not resolve by re-sending the
+      // same payment, which it throws as PAYMENT_UNCONFIRMED.
+      let signed = false;
       const f = await makePayingFetch({
         relayUrl,
         network: existing?.network ?? resolveNetwork(args),
@@ -595,13 +664,39 @@ async function main(): Promise<void> {
           ? { maxPaymentValueByInstrument: limits.maxPaymentValueByInstrument }
           : {}),
         ...(limits.expectedPayTo !== undefined ? { expectedPayTo: limits.expectedPayTo } : {}),
+        onSigned: () => {
+          signed = true;
+        },
       });
-      const res = await f(url);
+      let res: Response;
+      try {
+        res = await f(url);
+      } catch (err) {
+        const note = paidNotServed({ signed });
+        if (note === undefined) throw err;
+        console.error("error:", err instanceof Error ? err.message : String(err));
+        console.error(note);
+        process.exit(PAID_NOT_SERVED_EXIT_CODE);
+      }
       console.log(`${res.status} ${res.statusText}`);
       console.log(await res.text());
+      let settlement: string | undefined;
+      try {
+        const s = readPaymentResponseHeader<{ transaction?: unknown }>(res);
+        if (typeof s?.transaction === "string" && s.transaction.length > 0) settlement = s.transaction;
+      } catch {
+        // an unreadable PAYMENT-RESPONSE names no settlement
+      }
+      const notServed = paidNotServed({ signed, status: res.status, ...(settlement ? { settlement } : {}) });
+      if (notServed) {
+        console.error(notServed);
+        process.exit(PAID_NOT_SERVED_EXIT_CODE);
+      }
       break;
     }
     case "withdraw": {
+      const badArg = withdrawArgsError(args);
+      if (badArg) return fail(badArg);
       const to = flag(args, "--to");
       if (!to) return fail("usage: canton-agent-wallet withdraw --to <party> [--amount <n>] [--admin <registrar> --id <instrument>]");
       // PRESENT-BUT-EMPTY IS NOT ABSENT, and here the difference is the whole
@@ -668,7 +763,8 @@ async function main(): Promise<void> {
         );
       }
       const slippagePct = parseSlippagePct(flag(args, "--slippage"));
-      // Venue selection. Default CANTEX (Cantex Connect works today and is keyless);
+      // Venue selection. Default CANTEX for a CC input (keyless) and Tradecraft for a
+      // token input (resolveSwapTicket: Cantex has left token sells unaccepted);
       // `tradecraft` uses pool addresses; `auto` compares free quotes from both
       // eligible venues and picks the better expected output.
       const venue = parseSwapVenue(flag(args, "--venue"));
@@ -684,6 +780,14 @@ async function main(): Promise<void> {
         if (n.level === "warn") console.error(`  ! ${n.text}`);
         else console.log(`  ${n.text}`);
       };
+      // A swap the wallet cannot cover is refused here, before the ticket fee
+      // (a payment) is spent on it (swap-cover.ts).
+      if (existing) {
+        const coverRelay = new RelayClient({ relayUrl: resolveRelayUrl(args) ?? existing.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(existing) });
+        const fee = direct || venue === "auto" ? "0" : SWAP_TICKET_FEE_CC;
+        const refusal = await swapNotCovered(coverRelay, existing.party, intent, amount, fee);
+        if (refusal) return fail(refusal);
+      }
       const { ticket } = await resolveSwapTicket({
         intent,
         amount,
@@ -714,7 +818,7 @@ async function main(): Promise<void> {
       console.log(
         `quote: ${amount} ${inCanon} -> ~${ticket.quote} ${outCanon}\n  venue: ${ticket.venue}\n  pool: ${ticket.poolParty}`
       );
-      for (const n of swapFloorNotes(ticket, slippagePct, outCanon)) printNote(n);
+      for (const n of swapFloorNotes(ticket, slippagePct, outCanon, !direct && venue !== "auto")) printNote(n);
       // A registry output is preapproved by default so the pool can deliver it
       // directly (it delivers only to a preapproved receiver); --no-preapprove
       // opts out (e.g. the preapproval already exists).
@@ -773,9 +877,9 @@ async function main(): Promise<void> {
         // was returned (the per-tick claim picks that return up — `claimed` shows
         // it). A sub-minimum balance rise is reported as such, never as a fill.
         console.log(
-          `${head}\n  ! ${outCanon} not received yet — it may still be settling ` +
-            "(run `canton-agent-wallet claim` / check `balance`), or the trade was below " +
-            "the pool minimum and your input was returned" +
+          `${head}\n  ! ${outCanon} not received yet. It may still settle. If the pool did not take the ` +
+            "input, it waits in an offer until it expires and then comes back to the wallet. Check `balance` " +
+            "before swapping again; `claim` takes back an expired offer" +
             (sr.partialRise !== undefined
               ? `\n  note: ${outCanon} balance rose ${sr.partialRise}, below the ticket minimum ` +
                 `${ticket.minOutput} — possibly an unrelated inbound, not this swap's fill`
@@ -798,11 +902,11 @@ async function main(): Promise<void> {
       const usage =
         "usage: canton-agent-wallet tc setup --pair <A>/<B> [--fund <SYM>=<n>[,<SYM>=<n>]] | " +
         "tc orders --pair <A>/<B> --sell <SYM> (--amounts <n>[,<n>…] | --amount <n> [--count <k>]) [--slippage <pct>] | " +
-        "tc status --pair <A>/<B> | tc cancel --pair <A>/<B> [--order <cid>] | tc withdraw --pair <A>/<B> --instrument <SYM>";
+        "tc status --pair <A>/<B> | tc fills --pair <A>/<B> | tc cancel --pair <A>/<B> [--order <cid>] | tc withdraw --pair <A>/<B> --instrument <SYM>";
       const pair = (flag(args, "--pair") ?? "").split("/");
       if (!sub || pair.length !== 2 || !pair[0] || !pair[1]) return fail(usage);
       const w = requireWallet();
-      const ctx: TcContext = { relay: new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY }), wallet: w };
+      const ctx: TcContext = { relay: new RelayClient({ relayUrl: w.relayUrl, apiKey: API_KEY, readSigner: readSignerFromWallet(w) }), wallet: w };
       const pool = await loadTcPool(ctx, pair[0], pair[1]);
       const canon = (sym: string): string => {
         const leg = resolveSwapSymbol(sym);
@@ -848,6 +952,15 @@ async function main(): Promise<void> {
           console.log(`  ${sym} allocation: ${a ? a.funding : "none"}`);
         }
         console.log(`  open orders: ${st.openOrders}`);
+        console.log(
+          st.awaitingSettlement !== undefined
+            ? `  filled, awaiting settlement: ${st.awaitingSettlement}${st.awaitingSettlement > 0 ? " (tc fills shows which)" : ""}`
+            : `  filled, awaiting settlement: unknown (${st.fillsError ?? "the relay cannot read the history"})`
+        );
+      } else if (sub === "fills") {
+        const [head, ...rest] = formatTcFills(await tcFills(ctx, pool), { fullIds: false });
+        console.log(head);
+        for (const l of rest) console.log(`  ${l}`);
       } else if (sub === "cancel") {
         const r = await tcCancel(ctx, pool, flag(args, "--order"));
         if (r.length === 0) console.log(`no open orders on ${pool.ammId}`);
@@ -934,8 +1047,9 @@ async function main(): Promise<void> {
     }
     default:
       console.error(
-        "canton-agent-wallet: create | address | balance | claim | merge [--target <n>] [--batch <n>] [--max-rounds <n>] [--dry-run] [--yes] [--admin <registrar> --id <instrument> | --all-tokens] | preapproval [--status] [--admin <DSO|registrar>] [--id <instrument>] [--operator-token <t>] [--days <n>] [--expires-at <iso>] | pay [--asset <symbol>] [--max <amount>] [--pay-to <party>] <url> | swap --in <SYM> --out <SYM> --amount <n> [--venue cantex|tradecraft|auto] [--slippage <pct>] [--direct] [--no-wait] [--max-fee <cc>] [--swap-merchant <party>] [--no-preapprove] | withdraw --to <party> [--amount <n>] [--admin <registrar> --id <instrument>] | tc setup|orders|status|cancel|withdraw --pair <A>/<B> [...] | export | import | set-relay <url>\n" +
+        "canton-agent-wallet: create | address | balance | claim | merge [--target <n>] [--batch <n>] [--max-rounds <n>] [--dry-run] [--yes] [--admin <registrar> --id <instrument> | --all-tokens] | preapproval [--status] [--admin <DSO|registrar>] [--id <instrument>] [--operator-token <t>] [--days <n>] [--expires-at <iso>] | pay [--asset <symbol>] [--max <amount>] [--pay-to <party>] <url> | swap --in <SYM> --out <SYM> --amount <n> [--venue cantex|tradecraft|auto] [--slippage <pct>] [--direct] [--no-wait] [--max-fee <cc>] [--swap-merchant <party>] [--no-preapprove] | withdraw --to <party> [--amount <n>] [--admin <registrar> --id <instrument>] | tc setup|orders|status|fills|cancel|withdraw --pair <A>/<B> [...] | export | import | set-relay <url>\n" +
           "  relay required for create/pay/import: --relay-url <url> or CANTON_AGENT_RELAY_URL\n" +
+          `  pay exits ${PAID_NOT_SERVED_EXIT_CODE} when a payment was signed and the request did not succeed: it may have settled, do not pay again (check balance)\n` +
           "  preapproval = merchant TransferPreapproval setup for the transfer-factory (V3, 1-tx) path (--status to just check)."
       );
       process.exit(cmd ? 1 : 0);
@@ -959,7 +1073,7 @@ main().catch((e: unknown) => {
   console.error("error:", causeMsg ? `${msg} (cause: ${causeMsg})` : msg);
   // Network-reachability hint: the most common real-world failure is a proxy /
   // blocked egress, which the env-proxy support above fixes once configured.
-  if (/fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|UND_ERR/i.test(`${msg} ${causeMsg}`)) {
+  if (relayUnreachable(e, `${msg} ${causeMsg}`)) {
     console.error(
       "  could not reach the relay. If you are behind a proxy, export HTTPS_PROXY " +
         "(e.g. HTTPS_PROXY=http://user:pass@host:port) — the CLI routes through it. " +

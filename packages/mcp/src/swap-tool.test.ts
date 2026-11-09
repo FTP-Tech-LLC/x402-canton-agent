@@ -21,8 +21,17 @@ const calls = {
   payingFetch: [] as Array<Record<string, unknown>>,
 };
 let ticket: Record<string, unknown> = {};
+/** Tickets for the next resolveSwapTicket calls, in order; then `ticket`. */
+let ticketQueue: Array<Record<string, unknown>> = [];
+/** The free direct quote (direct: true) throws, as when the venue is down. */
+let failDirect = false;
+/** The endpoint ticket fails after its fee was paid; the send itself fails. */
+let ticketThrowsAfterFee = false;
+let executeThrows = false;
 let executeResult: Record<string, unknown> = {};
 let throwOnBalanceRead: number | undefined;
+/** What RelayClient.holdings answers; unset, it throws (a read that failed). */
+let holdingsResult: Record<string, unknown> | undefined;
 
 vi.mock("@ftptech/canton-agent-wallet", async (importOriginal) => {
   const actual = await importOriginal<typeof AgentWallet>();
@@ -39,6 +48,10 @@ vi.mock("@ftptech/canton-agent-wallet", async (importOriginal) => {
         const next = calls.balances.length > 1 ? calls.balances.shift()! : calls.balances[0]!;
         return { cc: next, amulet: 1 };
       }
+      async holdings() {
+        if (!holdingsResult) throw new Error("relay 502");
+        return holdingsResult;
+      }
     },
     resolveTrustedDsoParty: () => "DSO::1220dso",
     makePayingFetchForWallet: async (_w: unknown, opts: Record<string, unknown>) => {
@@ -47,14 +60,17 @@ vi.mock("@ftptech/canton-agent-wallet", async (importOriginal) => {
     },
     resolveSwapTicket: async (opts: Record<string, unknown>) => {
       calls.resolveTicket.push(opts);
+      if (failDirect && opts["direct"] === true) throw new Error("swap: Tradecraft GET /v1/pools failed (HTTP 503)");
       // The real router only builds the paying fetch on the endpoint path.
       if (opts["direct"] !== true && typeof opts["payingFetch"] === "function") {
         await (opts["payingFetch"] as () => Promise<unknown>)();
+        if (ticketThrowsAfterFee) throw new Error("swap: endpoint https://swap.test/swap failed (HTTP 500)");
       }
-      return { ticket, notes: [{ level: "warn", text: "routed note" }] };
+      return { ticket: ticketQueue.shift() ?? ticket, notes: [{ level: "warn", text: "routed note" }] };
     },
     executeSwap: async (opts: Record<string, unknown>) => {
       calls.execute.push(opts);
+      if (executeThrows) throw new Error("relay POST /v1/tx/execute -> 502 (socket hang up)");
       return executeResult;
     },
   };
@@ -71,12 +87,17 @@ describe("swap tool", () => {
   let home: string;
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), "x402mcp-swap-"));
-    calls.balances = ["20"];
+    calls.balances = ["100"];
     calls.balanceReads = 0;
     calls.resolveTicket.length = 0;
     calls.execute.length = 0;
     calls.payingFetch.length = 0;
     throwOnBalanceRead = undefined;
+    holdingsResult = undefined;
+    ticketQueue = [];
+    failDirect = false;
+    ticketThrowsAfterFee = false;
+    executeThrows = false;
     ticket = {
       venue: "cantex",
       poolParty: CANTEX_CONNECT_PARTY,
@@ -134,7 +155,7 @@ describe("swap tool", () => {
   });
 
   it("CC input: runs the shared router with the caller's venue/direct/slippage, executes, and reports what landed", async () => {
-    calls.balances = ["20", "19.99", "19.99"]; // before, after ticket (fee 0.01), final
+    calls.balances = ["100", "99.99", "39.99"]; // before, after ticket (fee 0.01), final
     const r = await swap(open, { in: "cc", out: "usdcx", amount: "60", venue: "tradecraft", slippage: 2, direct: true });
     expect(r.isError).toBe(false);
     expect(calls.resolveTicket).toHaveLength(1);
@@ -158,7 +179,7 @@ describe("swap tool", () => {
     expect(r.text).toContain("! no on-ledger floor on Cantex");
     expect(r.text).toContain("slippage 2%");
     expect(r.text).toContain("ticket fee 0.0100000000 CC");
-    expect(r.text).toContain("balance now 19.9900000000 CC");
+    expect(r.text).toContain("balance now 39.9900000000 CC");
   });
 
   it("venue omitted = cantex, NOT explicit (the router may fall back); wait:false is passed through", async () => {
@@ -169,7 +190,7 @@ describe("swap tool", () => {
   });
 
   it("books the fee and the CC input in the ledger, separately", async () => {
-    calls.balances = ["20", "19.99", "19.99"];
+    calls.balances = ["100", "99.99", "39.99"];
     await swap(open, { in: "CC", out: "USDCx", amount: "60" });
     const led = readLedger(home, Date.now());
     expect(led.spentTodayCC).toBeCloseTo(60.01, 8);
@@ -184,6 +205,18 @@ describe("swap tool", () => {
     expect(calls.payingFetch).toHaveLength(0);
     expect(calls.execute).toHaveLength(0);
     expect(calls.balanceReads).toBe(0);
+  });
+
+  it("a refusal at the per-tx or daily cap names where the owner raises it, when the server says", async () => {
+    const LIMITS = "https://pay.example/account#limits";
+    const perTx = await swap({ ...open, maxPerTx: 1, limitsUrl: LIMITS }, { in: "CC", out: "USDCx", amount: "60" });
+    expect(perTx.text).toContain(
+      "exceeds the per-tx cap of 1 CC. The owner can raise this limit on https://pay.example/account?maxPerTx=60#limits."
+    );
+    const daily = await swap({ ...open, dailyCap: 10, limitsUrl: LIMITS }, { in: "CC", out: "USDCx", amount: "60" });
+    expect(daily.text).toContain("The owner can raise this limit on https://pay.example/account?dailyCap=60#limits.");
+    const local = await swap({ ...open, maxPerTx: 1 }, { in: "CC", out: "USDCx", amount: "60" });
+    expect(local.text).not.toContain("raise this limit");
   });
 
   it("CC input: daily cap and funded ceiling apply, as for withdraw", async () => {
@@ -207,16 +240,40 @@ describe("swap tool", () => {
     expect(calls.payingFetch).toHaveLength(0); // direct never builds one
   });
 
-  it("token input: the per-tx cap is applied to the venue's quoted CC value, after the quote", async () => {
+  it("token input: the per-tx cap is checked on a free quote BEFORE the ticket fee", async () => {
     ticket = { ...ticket, quote: "5", minOutput: "4.9", memoValue: "Amulet", inInstrument: USDCX, outInstrument: null };
     calls.balances = ["20", "19.99"];
     const r = await swap({ ...open, maxPerTx: 1 }, { in: "USDCx", out: "CC", amount: "5" });
     expect(r.isError).toBe(true);
     expect(r.text).toMatch(/5 CC \(the venue's quoted value\) exceeds the per-tx cap of 1 CC/);
+    // Only the free direct quote ran: no paying fetch, no fee, nothing sent.
     expect(calls.resolveTicket).toHaveLength(1);
+    expect(calls.resolveTicket[0]!["direct"]).toBe(true);
+    expect(calls.payingFetch).toHaveLength(0);
     expect(calls.execute).toHaveLength(0);
-    // The fee was paid for the quote and is booked even though the swap was refused.
+    expect(readLedger(home, Date.now()).spentTodayCC).toBe(0);
+  });
+
+  it("token input: the bought ticket's quote is still checked after the fee", async () => {
+    // The free quote passes the cap; the endpoint's ticket quotes more.
+    const freeQuote = { ...ticket, quote: "0.5", minOutput: "0.49", memoValue: "Amulet", inInstrument: USDCX, outInstrument: null };
+    ticketQueue = [freeQuote, { ...freeQuote, quote: "5", minOutput: "4.9" }];
+    calls.balances = ["20", "19.99"];
+    const r = await swap({ ...open, maxPerTx: 1 }, { in: "USDCx", out: "CC", amount: "5" });
+    expect(r.isError).toBe(true);
+    expect(calls.resolveTicket).toHaveLength(2);
+    expect(calls.resolveTicket[1]!["direct"]).toBe(false);
+    expect(calls.execute).toHaveLength(0);
+    // That fee was paid for the quote and is booked although the swap was refused.
     expect(readLedger(home, Date.now()).spentTodayCC).toBeCloseTo(0.01, 8);
+  });
+
+  it("token input with direct: true quotes once and pays no fee", async () => {
+    ticket = { ...ticket, quote: "5", minOutput: "4.9", memoValue: "Amulet", inInstrument: USDCX, outInstrument: null };
+    const r = await swap({ ...open, maxPerTx: 1 }, { in: "USDCx", out: "CC", amount: "5", direct: true });
+    expect(r.isError).toBe(true);
+    expect(calls.resolveTicket).toHaveLength(1);
+    expect(calls.payingFetch).toHaveLength(0);
   });
 
   it("token -> CC that lands raises the funded high-water like `claim` does, and books no CC out beyond the fee", async () => {
@@ -236,10 +293,98 @@ describe("swap tool", () => {
     const blocked = await swap({ ...open, dailyCap: 100 }, { in: "USDCx", out: "CBTC", amount: "5" });
     expect(blocked.isError).toBe(true);
     expect(blocked.text).toMatch(/no CC value could be put on this swap/);
+    // Refused before any quote or ticket fee.
+    expect(calls.resolveTicket).toHaveLength(0);
+    expect(calls.payingFetch).toHaveLength(0);
     expect(calls.execute).toHaveLength(0);
     const ok = await swap(open, { in: "USDCx", out: "CBTC", amount: "5" });
     expect(ok.isError).toBe(false);
     expect(calls.execute).toHaveLength(1);
+  });
+
+  it("a CC input the wallet cannot cover, with the ticket fee, is refused before anything is paid", async () => {
+    calls.balances = ["60"];
+    const r = await swap(open, { in: "CC", out: "USDCx", amount: "60" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe("swap: the wallet has 60 CC, less than 60 CC plus the 0.01 CC ticket fee. Swap at most 59.99 CC. Nothing was paid.");
+    expect(calls.resolveTicket).toHaveLength(0);
+    expect(calls.payingFetch).toHaveLength(0);
+    // With direct (no fee) the same amount goes ahead.
+    expect((await swap(open, { in: "CC", out: "USDCx", amount: "60", direct: true })).isError).toBe(false);
+  });
+
+  it("a token input above what the wallet can spend is refused before the fee, and says what is locked", async () => {
+    ticket = { ...ticket, quote: "5", minOutput: "4.9", memoValue: "Amulet", inInstrument: USDCX, outInstrument: null };
+    holdingsResult = {
+      party: "agent::1220aaa",
+      complete: true,
+      instruments: [{ ...USDCX, total: "5", holdings: [{ cid: "a", amount: "3", locked: false }, { cid: "b", amount: "2", locked: true }] }],
+    };
+    const r = await swap(open, { in: "USDCx", out: "CC", amount: "5" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toBe("swap: the wallet can spend 3 USDCx, less than 5 (2 more is locked, in an offer or an allocation). Nothing was paid.");
+    expect(calls.resolveTicket).toHaveLength(0);
+    // A partial read is no balance: the swap goes ahead and the send decides.
+    holdingsResult = { ...holdingsResult, complete: false };
+    expect((await swap(open, { in: "USDCx", out: "CC", amount: "5" })).isError).toBe(false);
+  });
+
+  it("the cover checks are exact ledger decimals: a balance that covers to the atomic unit passes", async () => {
+    // 0.23 + 0.01 is 0.24000000000000002 in floats.
+    calls.balances = ["0.24"];
+    expect((await swap(open, { in: "CC", out: "USDCx", amount: "0.23" })).text).not.toMatch(/less than/);
+    calls.resolveTicket.length = 0;
+    ticket = { ...ticket, quote: "5", minOutput: "4.9", memoValue: "Amulet", inInstrument: USDCX, outInstrument: null };
+    holdingsResult = {
+      party: "agent::1220aaa",
+      complete: true,
+      instruments: [
+        {
+          ...USDCX,
+          total: "2111766.9774878023",
+          holdings: [
+            { cid: "a", amount: "1000000.1234567891", locked: false },
+            { cid: "b", amount: "1111766.8540310132", locked: false },
+          ],
+        },
+      ],
+    };
+    expect((await swap(open, { in: "USDCx", out: "CC", amount: "2111766.9774878023" })).text).not.toMatch(/can spend/);
+  });
+
+  it("token input under a cap: no free quote (the venue failed) leaves the decision to the bought ticket", async () => {
+    ticket = { ...ticket, quote: "0.5", minOutput: "0.49", memoValue: "Amulet", inInstrument: USDCX, outInstrument: null };
+    failDirect = true;
+    const r = await swap({ ...open, maxPerTx: 1 }, { in: "USDCx", out: "CC", amount: "5" });
+    expect(r.isError).toBe(false);
+    expect(calls.resolveTicket).toHaveLength(2);
+    // The free quote is held to a deadline: it runs with the timed builders.
+    expect(typeof (calls.resolveTicket[0]!["deps"] as Record<string, unknown>)["buildLocalTicket"]).toBe("function");
+    expect(calls.execute).toHaveLength(1);
+  });
+
+  it("a fee paid for a ticket that then failed is booked once", async () => {
+    calls.balances = ["100", "99.99"];
+    ticketThrowsAfterFee = true;
+    const r = await swap(open, { in: "CC", out: "USDCx", amount: "60" });
+    expect(r.isError).toBe(true);
+    expect(calls.execute).toHaveLength(0);
+    expect(readLedger(home, Date.now()).spentTodayCC).toBeCloseTo(0.01, 8);
+  });
+
+  it("a send that fails before anything is sent books the fee once, not twice", async () => {
+    calls.balances = ["100", "99.99", "99.99"];
+    executeThrows = true;
+    await swap(open, { in: "CC", out: "USDCx", amount: "60" });
+    expect(readLedger(home, Date.now()).spentTodayCC).toBeCloseTo(0.01, 8);
+  });
+
+  it("an input that left although its updateId was lost is booked, the fee not again", async () => {
+    calls.balances = ["100", "99.99", "39.99"];
+    executeThrows = true;
+    const r = await swap(open, { in: "CC", out: "USDCx", amount: "60" });
+    expect(r.text).toMatch(/funds MOVED/);
+    expect(readLedger(home, Date.now()).spentTodayCC).toBeCloseTo(60.01, 8);
   });
 
   it("an unknown symbol fails closed with nothing quoted, executed, or paid", async () => {

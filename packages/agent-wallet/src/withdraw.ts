@@ -6,6 +6,7 @@
  */
 import { loadWallet, type AgentWallet } from "./store.js";
 import { RelayClient } from "./relay-client.js";
+import { readSignerFromWallet } from "./keys.js";
 import { transfer } from "./tx.js";
 import { resolveHashBinding } from "./hash-binding.js";
 import { resolveTrustedRegistryParties } from "./registry-parties.js";
@@ -51,10 +52,10 @@ export interface WithdrawOpts {
    *  `wallet.relayUrl`. */
   relay?: RelayClient;
   /** Arbitrary on-ledger transfer meta to stamp onto the outgoing transfer.
-   *  Used by the `swap` command to carry a pool's minimum-output value in the
-   *  key the AMM parses. Advisory / not money-critical (verify-before-sign does
-   *  not pin transfer meta); omitted → only the venue tag on a registry token
-   *  (see venue.ts), no meta on Canton Coin. */
+   *  Used by the `swap` command to carry a pool's minimum-output value (or the
+   *  token Cantex buys) in the key the venue parses. verify-before-sign pins
+   *  the signed meta to exactly this plus the venue tag; omitted → only the
+   *  venue tag on a registry token (see venue.ts), no meta on Canton Coin. */
   meta?: Record<string, string>;
   /** Allow the registry two-step transfer-offer shape when the receiver has no
    *  preapproval (a swap to a Tradecraft pool). Threaded to verify-before-sign;
@@ -82,7 +83,7 @@ export async function withdraw(
   if (!wallet) throw new Error("no wallet — run `create` first");
   const relay =
     opts.relay ??
-    new RelayClient({ relayUrl: wallet.relayUrl, apiKey: opts.apiKey });
+    new RelayClient({ relayUrl: wallet.relayUrl, apiKey: opts.apiKey, readSigner: readSignerFromWallet(wallet) });
   // A registry token needs BOTH halves: the registrar (admin) and the id. One
   // without the other cannot name an instrument, so it is refused here rather
   // than silently falling back to Canton Coin — sending the wrong asset to an

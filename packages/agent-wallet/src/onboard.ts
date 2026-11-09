@@ -7,7 +7,7 @@
  * This is the flow proven by the Phase 0 live spike.
  */
 import { ED25519_WIRE_CONSTANTS } from "@ftptech/x402-canton-ledger";
-import { generateAgentKey, signHashB64, type AgentKeyMaterial } from "./keys.js";
+import { generateAgentKey, readSignerFromWallet, signHashB64, type AgentKeyMaterial } from "./keys.js";
 import { loadWallet, saveWallet, type AgentWallet } from "./store.js";
 import { RelayClient } from "./relay-client.js";
 import {
@@ -210,7 +210,15 @@ export async function ensureWallet(opts: EnsureWalletOpts): Promise<AgentWallet>
 
   const mode = opts.starterGrant ?? "wait";
   if (grant && mode !== "leave") {
-    const settled = acceptStarterGrant(relay, wallet, grant, {
+    // The wallet exists now: its own reads (the pending poll) carry a proof.
+    const readRelay =
+      opts.relay ??
+      new RelayClient({
+        relayUrl: opts.relayUrl,
+        apiKey: opts.apiKey,
+        readSigner: readSignerFromWallet(wallet),
+      });
+    const settled = acceptStarterGrant(readRelay, wallet, grant, {
       ...(opts.starterGrantTimeoutMs !== undefined ? { timeoutMs: opts.starterGrantTimeoutMs } : {}),
       ...(opts.starterGrantPollMs !== undefined ? { pollMs: opts.starterGrantPollMs } : {}),
     }).then((r) => {

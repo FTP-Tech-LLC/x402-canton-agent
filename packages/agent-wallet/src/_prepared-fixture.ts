@@ -144,6 +144,61 @@ export function vGenMap(entries: Array<{ key: Buffer; value: Buffer }>): Buffer 
   return len(13 /* Value.gen_map */, body);
 }
 
+/** Value.contract_id (oneof tag 9), e.g. an element of transfer.inputHoldingCids. */
+export function vContractId(cid: string): Buffer {
+  return str(9, cid);
+}
+
+/**
+ * Value.text_map (oneof tag 12): entries {key = 1 (string), value = 2 (Value)}.
+ * The shape of `transfer.meta.values`, read off a real MainNet transfer.
+ */
+export function vTextMap(entries: Record<string, string>): Buffer {
+  const body = Buffer.concat(
+    Object.entries(entries).map(([k, v]) =>
+      len(1 /* TextMap.entries */, Buffer.concat([str(1 /* key */, k), len(2 /* value */, vText(v))]))
+    )
+  );
+  return len(12 /* Value.text_map */, body);
+}
+
+/**
+ * Exercise.template_id (field 4) the way the participant encodes it: a
+ * structured Identifier {package_id = 1, module_name = 2, entity_name = 3},
+ * measured on the MainNet captures. `qualified` is "Module.Path:Entity".
+ */
+export function templateIdField(qualified: string, packageId = "ab".repeat(32)): Buffer {
+  const [moduleName, entityName] = qualified.split(":");
+  return len(
+    4 /* Exercise.template_id */,
+    Buffer.concat([str(1, packageId), str(2, moduleName ?? ""), str(3, entityName ?? "")])
+  );
+}
+
+/**
+ * The root contract's Metadata.input_contracts entry (InputContract.v1 = 1,
+ * created_at = 1000). Every MainNet capture lists the root's contract there;
+ * Canton Coin's is the DSO's ExternalPartyAmuletRules, signed by the DSO alone,
+ * which core pins for a CC transfer whose DSO is pinned.
+ */
+export function rootInputContract(o: {
+  dso: string;
+  contractId?: string;
+  signatories?: string[];
+}): Buffer {
+  const signatories = o.signatories ?? [o.dso];
+  const created = Buffer.concat([
+    str(1 /* lf_version */, "2.1"),
+    str(2 /* contract_id */, o.contractId ?? "00factory"),
+    str(3 /* package_name */, "splice-amulet"),
+    templateIdField(AMULET_FACTORY_TEMPLATE),
+    len(5 /* create_argument */, vRecord([{ label: "dso", value: vParty(o.dso) }])),
+    ...signatories.map((p) => str(6 /* signatories */, p)),
+    ...signatories.map((p) => str(7 /* stakeholders */, p)),
+  ]);
+  return Buffer.concat([len(1 /* InputContract.v1 */, created), vintField(1000 /* created_at */, 1)]);
+}
+
 /**
  * ATTACK builder: a single Daml `Value` message carrying `Value.numeric`
  * (oneof tag 6) TWICE — `decoy` first, `real` second. A first-occurrence-wins
@@ -225,7 +280,18 @@ export interface PreparedOpts extends TransferOpts {
   /** Exercise.contract_id of the root exercise (default "00factory"). Pass the
    *  resolved factory cid to match a caller pinning expectedContractId. */
   contractId?: string;
+  /** "Module:Entity" of the root's template. Default: the DSO's
+   *  ExternalPartyAmuletRules, the template every real Canton Coin transfer
+   *  roots on (the wallet pins it). `null` emits no template_id. */
+  templateId?: string | null;
+  /** List the root's contract among the input contracts, signed by
+   *  `rootInput` (see rootInputContract). Off by default: an unpinned DSO
+   *  in input-contract metadata is a foreign party to the backstop. */
+  rootInput?: string[];
 }
+
+/** The template a real Canton Coin `TransferFactory_Transfer` roots on. */
+export const AMULET_FACTORY_TEMPLATE = "Splice.ExternalPartyAmuletRules:ExternalPartyAmuletRules";
 
 /** Build a DamlTransaction.Node carrying a v1 Exercise. `contractId` defaults to
  *  "00factory" (the historical fixture value, kept so existing tests are
@@ -234,11 +300,14 @@ export interface PreparedOpts extends TransferOpts {
 export function exerciseNode(
   choiceId: string,
   chosenValue: Buffer,
-  contractId = "00factory"
+  contractId = "00factory",
+  /** "Module:Entity" of the exercised template; omitted → no template_id. */
+  templateId?: string
 ): Buffer {
   const exercise = Buffer.concat([
     str(1 /* lf_version */, "2.1"),
     str(2 /* contract_id */, contractId),
+    ...(templateId !== undefined ? [templateIdField(templateId)] : []),
     str(9 /* choice_id */, choiceId),
     len(10 /* chosen_value */, chosenValue),
     vintField(11 /* consuming */, 1),
@@ -253,7 +322,8 @@ export function exerciseNode(
 /** Build a full base64 PreparedTransaction with a single transfer exercise. */
 export function buildPrepared(o: PreparedOpts): string {
   const choiceId = o.choiceId ?? "TransferFactory_Transfer";
-  const node = exerciseNode(choiceId, choiceArgument(o, o.transferExtra), o.contractId);
+  const templateId = o.templateId === null ? undefined : (o.templateId ?? AMULET_FACTORY_TEMPLATE);
+  const node = exerciseNode(choiceId, choiceArgument(o, o.transferExtra), o.contractId, templateId);
 
   const nodes: Buffer[] = [len(3 /* DamlTransaction.nodes */, node)];
   if (o.secondExerciseChoice) {
@@ -275,6 +345,18 @@ export function buildPrepared(o: PreparedOpts): string {
   const metadata = Buffer.concat([
     len(2 /* submitter_info */, submitterInfo),
     str(3 /* synchronizer_id */, o.synchronizerId ?? "sync::1220aaaa"),
+    ...(o.rootInput !== undefined
+      ? [
+          len(
+            7 /* input_contracts */,
+            rootInputContract({
+              dso: o.admin,
+              contractId: o.contractId ?? "00factory",
+              signatories: o.rootInput,
+            })
+          ),
+        ]
+      : []),
   ]);
 
   const prepared = Buffer.concat([
@@ -284,12 +366,38 @@ export function buildPrepared(o: PreparedOpts): string {
   return prepared.toString("base64");
 }
 
-/** Convenience: build an honest prepared tx from sender/receiver/amount only. */
+/** The transfer fields after instrumentId, as a command carries them:
+ *  [4] requestedAt [5] executeBefore [6] inputHoldingCids [7] meta, the
+ *  layout of the MainNet captures. For `transferExtra`. */
+export function transferTail(t: {
+  requestedAt: string;
+  executeBefore: string;
+  inputHoldingCids: string[];
+  meta: { values: Record<string, string> };
+}): Array<{ label: string; value: Buffer }> {
+  const us = (iso: string): number => Date.parse(iso) * 1000;
+  return [
+    { label: "requestedAt", value: vTimestamp(us(t.requestedAt)) },
+    { label: "executeBefore", value: vTimestamp(us(t.executeBefore)) },
+    { label: "inputHoldingCids", value: vList(t.inputHoldingCids.map(vContractId)) },
+    { label: "meta", value: vRecord([{ label: "values", value: vTextMap(t.meta.values) }]) },
+  ];
+}
+
+/** Convenience: build an honest prepared tx from sender/receiver/amount only.
+ *  Pass `tail` (the command's transfer) when the caller pins the fields after
+ *  instrumentId, as transfer() does. */
 export function buildHonest(
   req: { sender: string; receiver: string; amount: string },
-  o: { admin?: string; id?: string; contractId?: string } = {}
+  o: {
+    admin?: string;
+    id?: string;
+    contractId?: string;
+    tail?: Parameters<typeof transferTail>[0];
+  } = {}
 ): string {
   return buildPrepared({
+    ...(o.tail !== undefined ? { transferExtra: transferTail(o.tail) } : {}),
     sender: req.sender,
     receiver: req.receiver,
     amount: req.amount,
@@ -752,4 +860,154 @@ export function buildPreparedEscrowAccept(o: EscrowAcceptOpts): string {
     len(2 /* PreparedTransaction.metadata */, metadata),
   ]);
   return prepared.toString("base64");
+}
+
+/* ════════════════════════════════════════════════════════════════════════
+ * Editing captured bytes: a protobuf reader/writer that keeps field order,
+ * enough to add a node to a real MainNet tree.
+ * ════════════════════════════════════════════════════════════════════════ */
+
+interface PbField {
+  field: number;
+  wire: number;
+  v?: bigint;
+  bytes?: Buffer;
+}
+
+function pbVarint(buf: Buffer, i: number): [bigint, number] {
+  let x = 0n;
+  let shift = 0n;
+  let b: number;
+  do {
+    b = buf[i++]!;
+    x |= BigInt(b & 0x7f) << shift;
+    shift += 7n;
+  } while (b & 0x80);
+  return [x, i];
+}
+
+function pbParse(buf: Buffer): PbField[] {
+  const out: PbField[] = [];
+  let i = 0;
+  while (i < buf.length) {
+    let key: bigint;
+    [key, i] = pbVarint(buf, i);
+    const field = Number(key >> 3n);
+    const wire = Number(key & 7n);
+    if (wire === 0) {
+      let v: bigint;
+      [v, i] = pbVarint(buf, i);
+      out.push({ field, wire, v });
+    } else if (wire === 1 || wire === 5) {
+      const n = wire === 1 ? 8 : 4;
+      out.push({ field, wire, bytes: buf.subarray(i, i + n) });
+      i += n;
+    } else if (wire === 2) {
+      let n: bigint;
+      [n, i] = pbVarint(buf, i);
+      out.push({ field, wire, bytes: buf.subarray(i, i + Number(n)) });
+      i += Number(n);
+    } else throw new Error(`wire ${wire}`);
+  }
+  return out;
+}
+
+function pbEncode(fields: PbField[]): Buffer {
+  const vint = (x: bigint): Buffer => {
+    const b: number[] = [];
+    do {
+      let c = Number(x & 0x7fn);
+      x >>= 7n;
+      if (x) c |= 0x80;
+      b.push(c);
+    } while (x);
+    return Buffer.from(b);
+  };
+  return Buffer.concat(
+    fields.map((f) => {
+      const key = vint((BigInt(f.field) << 3n) | BigInt(f.wire));
+      if (f.wire === 0) return Buffer.concat([key, vint(f.v!)]);
+      if (f.wire === 1 || f.wire === 5) return Buffer.concat([key, f.bytes!]);
+      return Buffer.concat([key, vint(BigInt(f.bytes!.length)), f.bytes!]);
+    })
+  );
+}
+
+/**
+ * A captured tree with one more create, a child of the root: the review's
+ * attack on PR #279 (a contract the sender signs, beside the honest delivery).
+ */
+export function withChildCreate(
+  b64: string,
+  o: { template: string; signatories: string[]; stakeholders: string[] }
+): string {
+  const asLen = (field: number, bytes: Buffer): PbField => ({ field, wire: 2, bytes });
+  const asStr = (field: number, s: string): PbField => asLen(field, Buffer.from(s, "utf8"));
+  const text = (f: PbField | undefined): string => Buffer.from(f?.bytes ?? []).toString("utf8");
+  const top = pbParse(Buffer.from(b64, "base64"));
+  const txI = top.findIndex((f) => f.field === 1);
+  const tx = pbParse(top[txI]!.bytes!);
+  const rootId = text(tx.find((f) => f.field === 2));
+  const newId = "9999";
+  for (const f of tx) {
+    if (f.field !== 3) continue;
+    const node = pbParse(f.bytes!);
+    if (text(node.find((x) => x.field === 1)) !== rootId) continue;
+    const v1I = node.findIndex((x) => x.field === 1000);
+    const v1 = pbParse(node[v1I]!.bytes!);
+    const exI = v1.findIndex((x) => x.field === 3);
+    const ex = pbParse(v1[exI]!.bytes!);
+    let last = -1;
+    ex.forEach((x, i) => {
+      if (x.field === 12) last = i;
+    });
+    ex.splice(last + 1, 0, asStr(12, newId));
+    v1[exI] = asLen(3, pbEncode(ex));
+    node[v1I] = asLen(1000, pbEncode(v1));
+    f.bytes = pbEncode(node);
+  }
+  const create = Buffer.concat([
+    str(1 /* lf_version */, "2.1"),
+    str(2 /* contract_id */, "00" + "ab".repeat(33)),
+    str(3 /* package_name */, "attacker-package"),
+    templateIdField(o.template, "cd".repeat(32)),
+    len(5 /* create_argument */, vRecord([{ label: "owner", value: vParty(o.signatories[0]!) }])),
+    ...o.signatories.map((p) => str(6, p)),
+    ...o.stakeholders.map((p) => str(7, p)),
+  ]);
+  tx.push(asLen(3, Buffer.concat([str(1, newId), len(1000, len(1 /* v1.Node.create */, create))])));
+  top[txI] = asLen(1, pbEncode(tx));
+  return pbEncode(top).toString("base64");
+}
+
+/** A captured tree whose root contract (its Metadata.input_contracts entry) is
+ *  signed by `signatories` instead. */
+export function withRootSignedBy(b64: string, signatories: string[]): string {
+  const asLen = (field: number, bytes: Buffer): PbField => ({ field, wire: 2, bytes });
+  const text = (f: PbField | undefined): string => Buffer.from(f?.bytes ?? []).toString("utf8");
+  const top = pbParse(Buffer.from(b64, "base64"));
+  const tx = pbParse(top.find((f) => f.field === 1)!.bytes!);
+  const rootId = text(tx.find((f) => f.field === 2));
+  let rootCid = "";
+  for (const f of tx.filter((x) => x.field === 3)) {
+    const node = pbParse(f.bytes!);
+    if (text(node.find((x) => x.field === 1)) !== rootId) continue;
+    const v1 = pbParse(node.find((x) => x.field === 1000)!.bytes!);
+    rootCid = text(pbParse(v1.find((x) => x.field === 3)!.bytes!).find((x) => x.field === 2));
+  }
+  const mdI = top.findIndex((f) => f.field === 2);
+  const md = pbParse(top[mdI]!.bytes!).map((f) => {
+    if (f.field !== 7) return f;
+    const ic = pbParse(f.bytes!);
+    const cI = ic.findIndex((x) => x.field === 1);
+    const c = pbParse(ic[cI]!.bytes!);
+    if (text(c.find((x) => x.field === 2)) !== rootCid) return f;
+    const kept = c.filter((x) => x.field !== 6);
+    const at = kept.findIndex((x) => x.field === 7);
+    kept.splice(at < 0 ? kept.length : at, 0, ...signatories.map((p) => asLen(6, Buffer.from(p, "utf8"))));
+    ic[cI] = asLen(1, pbEncode(kept));
+    return asLen(7, pbEncode(ic));
+  });
+  top[mdI] = asLen(2, pbEncode(md));
+  return pbEncode(top).toString("base64");
 }

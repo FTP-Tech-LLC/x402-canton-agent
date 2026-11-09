@@ -26,6 +26,11 @@ await server.connect(transport);
 console.error(
   `[canton-x402-mcp] up; relay=${config.relayUrl} home=${config.home} ` +
     `policy={maxPerTx=${config.policy.maxPerTx ?? "∞"}, daily=${config.policy.dailyCap ?? "∞"}, ` +
-    `domains=${config.policy.allowDomains === "*" ? "*" : config.policy.allowDomains.join("|") || "(none)"}, ` +
-    `fundedCeiling=${config.policy.fundedCeiling}}`
+    `domains=${typeof config.policy.allowDomains === "string" ? config.policy.allowDomains : config.policy.allowDomains.join("|") || "(none)"}, ` +
+    `fundedCeiling=${config.policy.fundedCeiling}} singlePayment=${config.singlePayment ? "on" : "off"} ` +
+    `usdcx=${
+      config.policy.usdcxMaxPerTx !== undefined && config.policy.usdcxDailyCap !== undefined
+        ? `${config.policy.usdcxMaxPerTx}/payment ${config.policy.usdcxDailyCap}/day`
+        : "off"
+    }`
 );

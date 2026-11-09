@@ -26,7 +26,7 @@ import { resolveTrustedDsoParty } from "./trusted-dso.js";
 import { resolveSwapSymbol, resolveTrustedRegistryParties } from "./registry-parties.js";
 import { computeMinOutput, parseTradecraftQuote, tradecraftMinInput } from "./swap.js";
 import { DEFAULT_TRADECRAFT_API } from "./swap-route.js";
-import type { RelayClient, ContractsResult } from "./relay-client.js";
+import type { RelayClient, ContractsResult, TradecraftUpdate } from "./relay-client.js";
 import type { AgentWallet } from "./store.js";
 import { KNOWN_TRADECRAFT_PACKAGE_IDS, type HashBindingOptions, type TradecraftParties } from "./verify-prepared.js";
 
@@ -46,8 +46,16 @@ export const TC_SWAP_ORDER_TEMPLATE_REF = "#canton-swap-amm-vault:TC.V4.SwapOrde
 const TC_WITHDRAWAL_TEMPLATE = "TC.V4.Settle.WithdrawalRequest:SettlementWithdrawalRequest";
 export const ALLOCATION_V2_INTERFACE =
   "#splice-api-token-allocation-v2:Splice.Api.Token.AllocationV2:Allocation";
-/** The read ids a relay must allowlist (CANTON_X402_WALLET_READ_IDS). */
-export const TC_RELAY_READ_IDS = [TC_BATCHER_TEMPLATE_REF, TC_SWAP_ORDER_TEMPLATE_REF, ALLOCATION_V2_INTERFACE];
+/** Optional on the relay: adds `tc withdraw` outcomes to `tc fills`. */
+export const TC_WITHDRAWAL_REQUEST_TEMPLATE_REF =
+  "#canton-swap-amm-vault:TC.V4.Settle.WithdrawalRequest:SettlementWithdrawalRequest";
+/** The read ids a relay allowlists (CANTON_X402_WALLET_READ_IDS). */
+export const TC_RELAY_READ_IDS = [
+  TC_BATCHER_TEMPLATE_REF,
+  TC_SWAP_ORDER_TEMPLATE_REF,
+  ALLOCATION_V2_INTERFACE,
+  TC_WITHDRAWAL_REQUEST_TEMPLATE_REF,
+];
 
 const META_AMM_ID = "tradecraft.fi/amm-id";
 const META_INSTRUMENT_ID = "tradecraft.fi/instrument-id";
@@ -59,7 +67,8 @@ type Disclosed = { templateId: string; contractId: string; createdEventBlob: str
 
 /** Tradecraft package ids trusted for the withdrawal request: the core's
  *  measured set, or CANTON_AGENT_TRADECRAFT_PACKAGE_IDS (comma-separated) for
- *  a newer release. The first one is the package the request is created in. */
+ *  a newer release. A withdrawal request is created in the venue's package
+ *  when it is among them, else in the first one (see withdrawalPackageId). */
 export function resolveTradecraftPackageIds(env: NodeJS.ProcessEnv = process.env): readonly string[] {
   const raw = env.CANTON_AGENT_TRADECRAFT_PACKAGE_IDS?.trim();
   if (!raw) return KNOWN_TRADECRAFT_PACKAGE_IDS;
@@ -708,6 +717,16 @@ export async function tcCancel(
   return out;
 }
 
+/** The package a withdrawal request is created in: the one the venue's live
+ *  AMMRules comes from, when this wallet trusts it (the venue moved to it), else
+ *  the first trusted id. The pool's disclosure is venue data, so it can only
+ *  pick among ids the wallet already trusts; verify-before-sign pins the same
+ *  list. */
+export function withdrawalPackageId(pool: Pick<TcPool, "ammRules">, trusted: readonly string[]): string {
+  const live = pool.ammRules.templateId.split(":")[0] ?? "";
+  return trusted.includes(live) ? live : trusted[0]!;
+}
+
 /** Ask the venue to release the agent's `symbol` allocation on `pool` to the
  *  wallet. Asynchronous: the venue fulfils or rejects the request later. */
 export async function tcWithdraw(ctx: TcContext, pool: TcPool, symbol: string): Promise<string> {
@@ -725,13 +744,14 @@ export async function tcWithdraw(ctx: TcContext, pool: TcPool, symbol: string): 
     );
   }
   const packageIds = resolveTradecraftPackageIds(env);
+  const pkg = withdrawalPackageId(pool, packageIds);
   return executeTradecraftCommand(
     ctx.relay,
     ctx.wallet,
     [
       {
         CreateCommand: {
-          templateId: `${packageIds[0]}:${TC_WITHDRAWAL_TEMPLATE}`,
+          templateId: `${pkg}:${TC_WITHDRAWAL_TEMPLATE}`,
           createArguments: {
             actor: ctx.wallet.party,
             venue: tradecraft.venue,
@@ -756,20 +776,398 @@ export interface TcStatus {
   batcher?: string;
   allocations: Record<string, TcAllocation>;
   openOrders: number;
+  /** Filled orders no settlement has paid out yet; undefined when the relay
+   *  could not say (see `fillsError`). */
+  awaitingSettlement?: number;
+  fillsError?: string;
 }
 
 export async function tcStatus(ctx: TcContext, pool: TcPool): Promise<TcStatus> {
-  const [batcher, allocations, open] = await Promise.all([
+  const [batcher, allocations, open, fills] = await Promise.all([
     findBatcher(ctx),
     findAllocations(ctx, pool),
     findOpenOrders(ctx, pool),
+    // The history read is extra: a relay without it must not cost the rest
+    // of the status.
+    tcFills(ctx, pool).then(
+      (f) => ({ ok: true as const, f }),
+      (e: unknown) => ({ ok: false as const, error: shownError(e) })
+    ),
   ]);
   return {
     ammId: pool.ammId,
     ...(batcher ? { batcher: batcher.contractId } : {}),
     allocations,
     openOrders: open.length,
+    ...(!fills.ok
+      ? { fillsError: fills.error }
+      : fills.f.awaitingSettlement !== undefined
+        ? { awaitingSettlement: fills.f.awaitingSettlement }
+        : { fillsError: fills.f.unknown ?? "the history could not be read" }),
   };
+}
+
+// ── fills and settlements ────────────────────────────────────────────────
+
+/** Where on the ledger something happened. */
+export interface TcAt {
+  offset: number;
+  updateId: string;
+  recordTime?: string;
+}
+
+export interface TcOrderHistory {
+  orderCid: string;
+  /** What the order sells, as the pool's symbol. */
+  sell?: { symbol: string; amount: string };
+  minOut?: string | null;
+  createdAt?: string;
+  /** `archived`: closed by a choice this wallet does not interpret (see `choice`). */
+  status: "open" | "filled" | "cancelled" | "withdrawn" | "expired" | "archived";
+  /** The choice that closed the order. */
+  choice?: string;
+  /** The transaction that filled or ended the order. */
+  ended?: TcAt;
+  /** The venue's reason on a cancellation. */
+  reason?: string;
+  /** A filled order: has its settlement paid out yet? */
+  settled?: boolean;
+  /** A settled order: what its settlement paid into the side it buys. */
+  received?: TcAt & { symbol: string; amount: string };
+}
+
+export interface TcSettlement extends TcAt {
+  /** `settlement`: the venue moved funds between the agent's allocations and
+   *  its vault; `top-up`: the agent funded its own allocation. */
+  kind: "settlement" | "top-up";
+  legs: Array<{ side: "receive" | "send"; amount: string; symbol: string }>;
+}
+
+export interface TcWithdrawalHistory {
+  requestCid: string;
+  symbol?: string;
+  status: "requested" | "fulfilled" | "rejected" | "cancelled" | "archived";
+  reason?: string;
+  /** The request's latest event. */
+  at: TcAt;
+}
+
+export interface TcFillsResult {
+  ammId: string;
+  /** Every order on the pool, oldest first. */
+  orders: TcOrderHistory[];
+  /** Settlements no order accounts for, and top-ups. */
+  settlements: TcSettlement[];
+  withdrawals: TcWithdrawalHistory[];
+  /** Filled orders whose settlement has not paid out yet; undefined when this
+   *  read cannot tell, and `unknown` says why. */
+  awaitingSettlement?: number;
+  unknown?: string;
+  /** False when the history was longer than one read. */
+  complete: boolean;
+  /** The ledger offset the read reached. */
+  readTo: number;
+  /** False when the relay does not read withdrawal requests. */
+  withdrawalsRead: boolean;
+}
+
+/** The pool's symbol for an instrument id as legs and orders name it. */
+function symbolFor(pool: TcPool, id: string, admin?: string): string {
+  const hit = Object.entries(pool.instruments).find(([, i]) => i.id === id && (admin === undefined || i.admin === admin));
+  return hit ? hit[0] : id;
+}
+
+function sameAmount(a: string, b: string): boolean {
+  try {
+    return toAtoms(a) === toAtoms(b);
+  } catch {
+    return false;
+  }
+}
+
+// ── text from the relay and the venue ──
+// tc fills and tc status print to a terminal and, through the MCP tools, to an
+// agent. The venue writes a cancellation's reason and the relay everything
+// else, so a value is shown only in the shape it is expected to have.
+// Contract and update ids are hex on the ledger; letters, digits, "_" and "-"
+// cannot carry a sentence or a party id ("::").
+const ID_SHAPE = /^[0-9A-Za-z_-]{1,600}$/;
+const CHOICE_SHAPE = /^[A-Za-z][A-Za-z0-9_]{0,79}$/;
+const TIME_SHAPE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z$/;
+const AMOUNT_SHAPE = /^\d{1,28}(\.\d{1,10})?$/;
+const SYMBOL_SHAPE = /^[A-Za-z0-9._-]{1,32}$/;
+/** A venue reason is shown when it has a known shape: Tradecraft's slippage
+ *  message, or plain words. Words alone cannot carry a party id or an amount,
+ *  so a reason cannot tell an agent where to send funds. */
+const REASON_SHAPES = [
+  /^Output \d{1,28}(\.\d{1,10})? is below minimum \d{1,28}(\.\d{1,10})?$/,
+  /^[A-Za-z][A-Za-z ]{0,79}$/,
+];
+const HIDDEN_REASON = "a reason this wallet does not show";
+
+function reasonShown(r: unknown): string | undefined {
+  if (r === undefined || r === null) return undefined;
+  if (typeof r === "string") return REASON_SHAPES.some((x) => x.test(r)) ? r : HIDDEN_REASON;
+  const tag = (r as { tag?: unknown }).tag;
+  return typeof tag === "string" && CHOICE_SHAPE.test(tag) ? tag : HIDDEN_REASON;
+}
+
+/** An error message for display: no control characters, at most 200 characters. */
+export function shownError(e: unknown): string {
+  const m = e instanceof Error ? e.message : String(e);
+  return m.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").slice(0, 200);
+}
+
+const ORDER_KINDS = new Set(["created", "filled", "cancelled", "withdrawn", "expired", "archived"]);
+const REQUEST_KINDS = new Set(["requested", "fulfilled", "rejected", "cancelled", "archived"]);
+const POOL_SHAPE = /^[A-Za-z0-9 /._-]{1,64}$/;
+
+/** Why a relay record is not used, or undefined when every field has its shape. */
+function malformed(u: TradecraftUpdate): string | undefined {
+  if (!Number.isSafeInteger(u.offset) || !ID_SHAPE.test(u.updateId)) return "an update without a readable offset or id";
+  for (const o of u.orders) {
+    if (!ID_SHAPE.test(o.orderCid)) return "an order with an unreadable id";
+    if (!ORDER_KINDS.has(o.kind)) return "an order with an unknown kind";
+    if (o.choice !== undefined && !CHOICE_SHAPE.test(o.choice)) return "an order closed by an unreadable choice";
+    if (o.sell && (!AMOUNT_SHAPE.test(o.sell.amount) || !SYMBOL_SHAPE.test(o.sell.instrument.id))) return "an order with an unreadable sale";
+  }
+  for (const a of u.allocations) {
+    for (const l of a.legs) {
+      if (!AMOUNT_SHAPE.test(l.amount) || !SYMBOL_SHAPE.test(l.instrumentId)) return "a settlement leg with an unreadable amount";
+    }
+  }
+  for (const w of u.withdrawals) {
+    if (!ID_SHAPE.test(w.requestCid)) return "a withdrawal request with an unreadable id";
+    if (!REQUEST_KINDS.has(w.kind)) return "a withdrawal request with an unknown kind";
+  }
+  return undefined;
+}
+
+/**
+ * The agent's queued-mode history on `pool`, read from the relay's per-party
+ * Tradecraft history from the start of the ledger, at most `maxPages` reads of
+ * 200 rows.
+ *
+ * A fill carries no amount. The venue settles each fill on its own, later, in
+ * one transaction that sends exactly the order's input from the agent's
+ * allocation to the vault and pays the output into the other one (MainNet,
+ * October 2026: five fills in one transaction got five settlements, and two
+ * waited ten hours). So a filled order is matched to the first later
+ * settlement that sent its input amount on this pool, and `received` is that
+ * settlement's payout. Legs between the agent's own holdings and its
+ * allocation are top-ups, never settlements. A filled order with no match
+ * counts in `awaitingSettlement`.
+ *
+ * The match needs the whole history: read from a later offset, an earlier
+ * fill's late settlement would be credited to a newer fill of the same
+ * amount. So there is no cursor here, and the count is withheld when the read
+ * stopped early, when the relay could not read some of the agent's records,
+ * or when an order on the pool was closed by a choice this wallet does not
+ * interpret.
+ */
+export async function tcFills(ctx: TcContext, pool: TcPool, opts: { maxPages?: number } = {}): Promise<TcFillsResult> {
+  const party = ctx.wallet.party;
+  const orders = new Map<string, TcOrderHistory>();
+  const withdrawals = new Map<string, TcWithdrawalHistory>();
+  const moves: TcSettlement[] = [];
+  const anomalies: string[] = [];
+  // Every order's pool, from its create: an archive whose create was on an
+  // earlier page carries no terms and is placed by its contract id.
+  const poolOf = new Map<string, string>();
+  const unplaced = new Set<string>();
+  let withdrawalsRead = true;
+  let after = 0;
+  let complete = false;
+  let participant: string | undefined;
+  const maxPages = opts.maxPages ?? 20;
+  const at = (u: TradecraftUpdate): TcAt => ({
+    offset: u.offset,
+    updateId: u.updateId,
+    ...(u.recordTime && TIME_SHAPE.test(u.recordTime) ? { recordTime: u.recordTime } : {}),
+  });
+  const take = (u: TradecraftUpdate): void => {
+    // The relay's own wording of what it could not read is not shown.
+    for (const a of u.anomalies ?? []) {
+      if (a.ammId === undefined || a.ammId === pool.ammId) anomalies.push(`at offset ${u.offset}`);
+    }
+    const bad = malformed(u);
+    if (bad !== undefined) {
+      anomalies.push(`${bad} at offset ${Number.isSafeInteger(u.offset) ? u.offset : "?"}`);
+      return;
+    }
+    for (const o of u.orders) {
+      if (o.ammId !== undefined) poolOf.set(o.orderCid, o.ammId);
+      const ammId = o.ammId ?? poolOf.get(o.orderCid);
+      if (ammId === undefined) {
+        unplaced.add(o.orderCid);
+        continue;
+      }
+      if (ammId !== pool.ammId) continue;
+      const entry: TcOrderHistory = orders.get(o.orderCid) ?? {
+        orderCid: o.orderCid,
+        ...(o.sell ? { sell: { symbol: symbolFor(pool, o.sell.instrument.id, o.sell.instrument.admin), amount: o.sell.amount } } : {}),
+        ...(o.minOut === null || (typeof o.minOut === "string" && AMOUNT_SHAPE.test(o.minOut)) ? { minOut: o.minOut } : {}),
+        ...(o.createdAt ? { createdAt: o.createdAt } : {}),
+        status: "open",
+      };
+      if (o.kind !== "created") {
+        entry.status = o.kind;
+        entry.ended = at(u);
+        if (o.choice !== undefined) entry.choice = o.choice;
+        const reason = reasonShown(o.reason);
+        if (reason !== undefined) entry.reason = reason;
+      }
+      orders.set(o.orderCid, entry);
+    }
+    for (const w of u.withdrawals) {
+      if (w.ammId !== pool.ammId) continue;
+      const prev = withdrawals.get(w.requestCid);
+      const reason = reasonShown(w.reason);
+      withdrawals.set(w.requestCid, {
+        requestCid: w.requestCid,
+        ...(w.instrument && SYMBOL_SHAPE.test(w.instrument.id)
+          ? { symbol: symbolFor(pool, w.instrument.id, w.instrument.admin) }
+          : prev?.symbol
+            ? { symbol: prev.symbol }
+            : {}),
+        status: w.kind,
+        ...(reason !== undefined ? { reason } : {}),
+        at: at(u),
+      });
+    }
+    const settle: TcSettlement["legs"] = [];
+    const topUp: TcSettlement["legs"] = [];
+    for (const a of u.allocations) {
+      if (a.ammId !== pool.ammId) continue;
+      for (const l of a.legs) {
+        (l.counterparty === party ? topUp : settle).push({ side: l.side, amount: l.amount, symbol: symbolFor(pool, l.instrumentId) });
+      }
+    }
+    if (settle.length > 0) moves.push({ ...at(u), kind: "settlement", legs: settle });
+    if (topUp.length > 0) moves.push({ ...at(u), kind: "top-up", legs: topUp });
+  };
+  for (let page = 0; page < maxPages; page++) {
+    const r = await ctx.relay.tradecraftUpdates(party, { after, limit: 200 });
+    // Offsets belong to one participant: a switch mid-read mixes two ledgers.
+    if (participant !== undefined && r.participant !== undefined && r.participant !== participant) {
+      throw new Error("the relay moved this party to another participant during the read; run it again");
+    }
+    participant ??= r.participant;
+    if (r.withdrawalsRead === false) withdrawalsRead = false;
+    // The cursor is a number and moves forward, or the read stops here.
+    if (!Number.isSafeInteger(r.next) || typeof r.complete !== "boolean" || !Array.isArray(r.updates)) {
+      throw new Error("the relay answered the history read in an unexpected shape");
+    }
+    for (const u of r.updates) take(u);
+    if (r.complete) {
+      after = r.next;
+      complete = true;
+      break;
+    }
+    // A cursor that does not move would ask for the same page again.
+    if (!(r.next > after)) throw new Error(`the relay's history cursor did not advance past offset ${after}`);
+    after = r.next;
+  }
+
+  // Match settlements to fills, oldest first; a settlement in the fill's own
+  // transaction counts.
+  const filled = [...orders.values()]
+    .filter((o) => o.status === "filled" && o.ended !== undefined)
+    .sort((a, b) => a.ended!.offset - b.ended!.offset);
+  for (const o of filled) o.settled = false;
+  const unmatched: TcSettlement[] = [];
+  for (const m of moves) {
+    if (m.kind === "top-up") {
+      unmatched.push(m);
+      continue;
+    }
+    const sends = m.legs.filter((l) => l.side === "send");
+    const receives = m.legs.filter((l) => l.side === "receive");
+    let used = false;
+    for (const leg of sends) {
+      const o = filled.find(
+        (f) => !f.settled && f.ended!.offset <= m.offset && f.sell?.symbol === leg.symbol && sameAmount(f.sell.amount, leg.amount)
+      );
+      if (!o) continue;
+      o.settled = true;
+      used = true;
+      // The payout is this fill's only when the settlement moved one fill.
+      const got = sends.length === 1 && receives.length === 1 && receives[0]!.symbol !== leg.symbol ? receives[0]! : undefined;
+      if (got) o.received = { offset: m.offset, updateId: m.updateId, ...(m.recordTime ? { recordTime: m.recordTime } : {}), symbol: got.symbol, amount: got.amount };
+    }
+    if (!used) unmatched.push(m);
+  }
+
+  const strange = [...orders.values()].find((o) => o.status === "archived");
+  const termless = filled.find((o) => o.sell === undefined);
+  const unknown = !complete
+    ? `the history is longer than one read (it stopped at offset ${after})`
+    : anomalies.length > 0
+      ? `${anomalies.length} of this wallet's records could not be read (the first ${anomalies[0]})`
+      : strange
+        ? `order ${strange.orderCid} was closed by ${strange.choice ?? "a choice"} this wallet does not interpret`
+        : termless
+          ? `order ${termless.orderCid} filled, but what it sold is not in this history`
+          : unplaced.size > 0
+            ? `${unplaced.size} orders closed whose creation is not in this history`
+            : undefined;
+  return {
+    ammId: pool.ammId,
+    orders: [...orders.values()],
+    settlements: unmatched,
+    withdrawals: [...withdrawals.values()],
+    ...(unknown === undefined ? { awaitingSettlement: filled.filter((o) => !o.settled).length } : { unknown }),
+    complete,
+    readTo: after,
+    withdrawalsRead,
+  };
+}
+
+/** `tcFills` as lines of text, for the CLI and the MCP tool: open orders and
+ *  fills awaiting settlement in full, then the `recent` latest other orders. */
+export function formatTcFills(f: TcFillsResult, opts: { fullIds: boolean; recent?: number }): string[] {
+  const short = (s: string) => (opts.fullIds ? s : `${s.slice(0, 16)}…`);
+  const when = (e: TcAt) => `${e.recordTime ?? "?"}, update ${short(e.updateId)}`;
+  const what = (o: TcOrderHistory) => (o.sell ? `sell ${o.sell.amount} ${o.sell.symbol}${o.minOut ? `, min out ${o.minOut}` : ""}` : "order");
+  const lines = [`pool ${POOL_SHAPE.test(f.ammId) ? f.ammId : "?"}`];
+  if (!f.complete) lines.push(`history read up to offset ${f.readTo} only: later events are missing below`);
+  // With the count withheld, "awaiting" is not established either.
+  const pendingLabel = f.awaitingSettlement !== undefined ? "awaiting settlement" : "no settlement found in what was read";
+  const open = f.orders.filter((o) => o.status === "open");
+  const waiting = f.orders.filter((o) => o.status === "filled" && !o.settled);
+  const rest = f.orders.filter((o) => o.status !== "open" && !(o.status === "filled" && !o.settled));
+  const keep = Math.max(0, opts.recent ?? 20);
+  const recent = keep > 0 ? rest.slice(-keep) : []; // slice(-0) would keep them all
+  // An open order's id is what `cancel` takes, so it is never shortened.
+  for (const o of open) lines.push(`open order ${o.orderCid}: ${what(o)}`);
+  for (const o of waiting) lines.push(`order ${short(o.orderCid)}: ${what(o)}: filled (${when(o.ended!)}); ${pendingLabel}`);
+  if (rest.length > recent.length) lines.push(`(${rest.length - recent.length} earlier orders not shown)`);
+  for (const o of recent) {
+    const state =
+      o.status === "filled"
+        ? `filled (${when(o.ended!)}); settled${o.received ? `: received ${o.received.amount} ${o.received.symbol} (${when(o.received)})` : ""}`
+        : `${o.status === "archived" ? `closed by ${o.choice ?? "an unknown choice"}` : o.status} (${when(o.ended!)})${o.reason ? `: ${o.reason}` : ""}`;
+    lines.push(`order ${short(o.orderCid)}: ${what(o)}: ${state}`);
+  }
+  if (!f.withdrawalsRead) lines.push("withdrawal requests: this relay does not read them");
+  for (const w of f.withdrawals.slice(-5)) {
+    lines.push(`withdrawal request ${short(w.requestCid)}${w.symbol ? ` (${w.symbol})` : ""}: ${w.status}${w.reason ? `: ${w.reason}` : ""} (${when(w.at)})`);
+  }
+  for (const s of f.settlements.filter((m) => m.kind === "settlement")) {
+    const legs = s.legs.map((l) => `${l.side === "receive" ? "received" : "sent"} ${l.amount} ${l.symbol}`).join(", ");
+    lines.push(`settlement matched to no order (${when(s)}): ${legs}`);
+  }
+  const counts = (["filled", "cancelled", "withdrawn", "expired", "archived", "open"] as const)
+    .map((k) => [k, f.orders.filter((o) => o.status === k).length] as const)
+    .filter(([, n]) => n > 0)
+    .map(([k, n]) => `${n} ${k === "archived" ? "closed otherwise" : k}`);
+  lines.push(counts.length > 0 ? `orders: ${counts.join(", ")}` : "no orders on this pool");
+  lines.push(
+    f.awaitingSettlement !== undefined
+      ? `filled, awaiting settlement: ${f.awaitingSettlement}`
+      : `filled, awaiting settlement: unknown (${f.unknown ?? "the history could not be read"})`
+  );
+  return lines;
 }
 
 // 10-dp decimals as BigInt atoms (every Tradecraft instrument is 10-dp).

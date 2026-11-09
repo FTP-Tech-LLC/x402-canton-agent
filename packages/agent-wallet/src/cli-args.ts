@@ -12,6 +12,7 @@ import {
   KNOWN_INSTRUMENTS,
   resolveSwapSymbol,
 } from "./registry-parties.js";
+import { RelayHttpError, isOutcomeUnknownError } from "./relay-client.js";
 
 export const DEFAULT_NETWORK = "canton:testnet";
 
@@ -170,6 +171,58 @@ export const MISSING_RELAY_HELP =
   "no relay URL — pass --relay-url <url> or set CANTON_AGENT_RELAY_URL.\n" +
   "  e.g. canton-agent-wallet create --relay-url https://facilitator.ftptech.xyz";
 
+/** Whether a failure gets the "could not reach the relay" hint. Not for an
+ *  answer the relay sent (its body can say "fetch failed" about its own hop),
+ *  nor for a submission or payment that may have landed: a re-run could send
+ *  it twice. */
+export function relayUnreachable(err: unknown, text: string): boolean {
+  if (err instanceof RelayHttpError || isOutcomeUnknownError(err) || isPaymentUnconfirmed(err)) {
+    return false;
+  }
+  return /fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|UND_ERR/i.test(text);
+}
+
+/** The x402 client's PAYMENT_UNCONFIRMED, on `err` or an error it wraps: the
+ *  payment may have settled. */
+function isPaymentUnconfirmed(err: unknown): boolean {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 6; depth++) {
+    if ((cur as { code?: unknown }).code === "PAYMENT_UNCONFIRMED") return true;
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
+/** Every option `withdraw` reads. All take a value. */
+const WITHDRAW_FLAGS: ReadonlySet<string> = new Set([
+  "--to",
+  "--amount",
+  "--admin",
+  "--id",
+  "--relay-url",
+]);
+
+/** Refusal for the first argument `withdraw` would ignore: a dropped amount
+ *  (`withdraw --to x 5`, `--amt 5`) would send the FULL balance. */
+export function withdrawArgsError(args: readonly string[]): string | undefined {
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] as string;
+    const name = a.startsWith("-") ? (a.split("=")[0] as string) : undefined;
+    if (name !== undefined && WITHDRAW_FLAGS.has(name)) {
+      if (!a.includes("=")) i += 1; // skip this flag's value
+      continue;
+    }
+    return (
+      (name !== undefined
+        ? `withdraw: unknown option ${name}`
+        : `withdraw: unexpected argument ${JSON.stringify(a)}`) +
+      `. Refusing: withdraw takes only --to, --amount, --admin, --id and ` +
+      `--relay-url. Pass the amount as --amount <n>; omit --amount to send the FULL balance.`
+    );
+  }
+  return undefined;
+}
+
 /**
  * The `--amount` decision for `withdraw`, as a value rather than a branch.
  *
@@ -224,6 +277,58 @@ export function preapprovalMode(
     mode: "self",
     ambientIgnored: Boolean(env["CANTON_X402_OPERATOR_TOKEN"]),
   };
+}
+
+/**
+ * Exit code of `pay` when a payment was signed and the request did not end in
+ * a 2xx: the payment may have settled, do not pay again. Distinct from 1 (the
+ * command failed with nothing signed) so a script can tell the two apart.
+ */
+export const PAID_NOT_SERVED_EXIT_CODE = 2;
+
+/**
+ * What `pay` says, and exits PAID_NOT_SERVED_EXIT_CODE on, when a payment was
+ * signed and the merchant's final answer is not 2xx (`status`), or the request
+ * failed after signing (no `status`). It used to print the status and exit 0,
+ * so a script that checks the exit code read a paid failure as success and the
+ * next run paid again. `settlement` is the merchant's PAYMENT-RESPONSE id when
+ * it sent one. Undefined when nothing was signed or the answer is 2xx.
+ */
+export function paidNotServed(o: {
+  signed: boolean;
+  status?: number;
+  settlement?: string;
+}): string | undefined {
+  if (!o.signed) return undefined;
+  if (o.status !== undefined && o.status >= 200 && o.status < 300) return undefined;
+  return (
+    `pay: a payment was signed and ` +
+    (o.status !== undefined ? `the merchant answered HTTP ${o.status}` : `the request failed`) +
+    (o.settlement ? ` (settlement ${o.settlement})` : "") +
+    `. It may have settled: do NOT pay again for this request; check: canton-agent-wallet balance`
+  );
+}
+
+/**
+ * What `preapproval` does with the relay's Canton Coin status answer.
+ *
+ * A create is not idempotent: each one prepays a new holding fee and leaves
+ * another live TransferPreapproval for the same receiver. So only a status that
+ * was actually read may lead to one. `hasPreapproval: null` means the relay
+ * could not tell (its note says why), and reading that as "none" bought a
+ * merchant a second preapproval. `--force` is the operator saying it anyway.
+ *
+ * Renewal keeps its old rule: skip only a preapproval that is provably live (a
+ * relay that predates the expiry fix reports `true` for an expired one).
+ */
+export function amuletPreapprovalPlan(
+  status: { hasPreapproval: boolean | null; expired?: boolean | undefined; expiresAt?: string | undefined },
+  force: boolean
+): "skip" | "refuse-unknown" | "create" {
+  if (force) return "create";
+  if (status.hasPreapproval === true && status.expired !== true) return "skip";
+  if (status.hasPreapproval === null && status.expired !== true) return "refuse-unknown";
+  return "create";
 }
 
 /**

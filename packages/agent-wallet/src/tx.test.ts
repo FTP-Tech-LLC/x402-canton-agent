@@ -6,7 +6,7 @@ import { generateAgentKey, verifyHashB64 } from "./keys.js";
 import { PreparedTransferMismatchError, type HashBindingOptions } from "./verify-prepared.js";
 import type { AgentWallet } from "./store.js";
 // Faithful Canton PreparedTransaction builder (real Ledger API field numbers).
-import { buildPrepared, buildPreparedAccept } from "./_prepared-fixture.js";
+import { buildPrepared, buildPreparedAccept, transferTail } from "./_prepared-fixture.js";
 
 /** Deterministic stand-in for Canton's V2 hash (plain sha256 of the bytes).
  *  Lets these tests exercise the real recompute-and-compare BINDING; the
@@ -101,7 +101,7 @@ function stubRelay(script: RelayScript = {}): { executed: () => boolean; seen: s
               )
             : buildHonest(
                 { sender: ex.sender, receiver: ex.receiver, amount: ex.amount },
-                { contractId: cmd.contractId }
+                { contractId: cmd.contractId, tail: ex }
               )
           : buildPreparedAccept({ selfParty: "agent::1220abcd" });
         return new Response(
@@ -139,7 +139,7 @@ function stubRelay(script: RelayScript = {}): { executed: () => boolean; seen: s
 
 function buildHonest(
   req: { sender: string; receiver: string; amount: string },
-  o: { contractId?: string } = {}
+  o: { contractId?: string; tail?: Parameters<typeof transferTail>[0] } = {}
 ): string {
   return buildPrepared({
     sender: req.sender,
@@ -148,6 +148,8 @@ function buildHonest(
     admin: DSO,
     id: "Amulet",
     ...(o.contractId !== undefined ? { contractId: o.contractId } : {}),
+    // transfer() pins the fields after instrumentId to its own command.
+    ...(o.tail !== undefined ? { transferExtra: transferTail(o.tail) } : {}),
   });
 }
 
@@ -375,10 +377,23 @@ describe("payViaTransferFactory — inline carriage", () => {
     amount: AMOUNT,
     admin: DSO,
     id: "Amulet",
+    // The DSO is pinned: its factory must be among the input contracts.
+    rootInput: [DSO],
   });
   const HASH = createHash("sha256").update(PREPARED).digest("base64");
+  /** The same transfer rooted on a registry factory, as a registry token's is. */
+  const REGISTRY_PREPARED = buildPrepared({
+    sender: PARTY,
+    receiver: MERCHANT,
+    amount: AMOUNT,
+    admin: DSO,
+    id: "Amulet",
+    templateId: "Utility.Registry.App.V0.Model.TransferPreapproval:TransferPreapproval",
+    // No DSO factory among the inputs: a registry token named "Amulet" is
+    // still not Canton Coin, so the DSO root pin does not apply to it.
+  });
 
-  function harness() {
+  function harness(prepared = PREPARED) {
     const calls: { prepare: Record<string, unknown>[]; commit: unknown[] } = {
       prepare: [],
       commit: [],
@@ -388,8 +403,8 @@ describe("payViaTransferFactory — inline carriage", () => {
         calls.prepare.push(b);
         return {
           submissionRef: "ref-1",
-          preparedTransaction: PREPARED,
-          txHash: HASH,
+          preparedTransaction: prepared,
+          txHash: prepared === PREPARED ? HASH : createHash("sha256").update(prepared).digest("base64"),
           executeBefore: new Date(Date.now() + 60_000).toISOString(),
           sender: PARTY,
           receiver: MERCHANT,
@@ -448,7 +463,7 @@ describe("payViaTransferFactory — inline carriage", () => {
   });
 
   it("registry token: DOES send instrumentId {admin,id} to the relay", async () => {
-    const { relay, calls } = harness();
+    const { relay, calls } = harness(REGISTRY_PREPARED);
     await payViaTransferFactory(relay, wallet, {
       receiver: MERCHANT,
       amount: AMOUNT,

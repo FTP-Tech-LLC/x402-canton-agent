@@ -1,5 +1,131 @@
 # @ftptech/canton-x402-mcp
 
+## 2.7.1
+
+### Patch Changes
+
+- Uses `@ftptech/canton-agent-wallet` 2.8.1.
+- `engines.node` is `>=20.18.1` (was `>=18`), what `undici` 7 needs.
+
+## 2.7.0
+
+### Minor Changes
+
+- Paid requests follow `@ftptech/x402-canton-client` 1.4.0: a 5xx after
+  payment is re-sent with the same payment, then reported as not confirmed;
+  the tool never pays twice for it.
+- Reads of the wallet's own party are signed for the relay.
+- Uses `@ftptech/canton-agent-wallet` 2.8.0.
+
+## 2.6.2
+
+### Patch Changes
+
+- `claim` runs in the wallet's queue with pay, withdraw and swap. Two claims at
+  once each prepared and executed an accept for the same pending transfers; one
+  failed and could answer that every accept failed although the funds had
+  arrived. Uses `@ftptech/canton-agent-wallet` 2.7.2.
+
+## 2.6.1
+
+### Patch Changes
+
+- `swap`: an output not received says the input waits in an offer until it
+  expires, for CC as well as tokens (a CC offer comes back by itself), and a
+  direct or auto swap without a floor names `CANTON_AGENT_TRADECRAFT_MEMO_KEY`.
+  `swap_quote` says when swap would refuse an amount below Tradecraft's minimum.
+  Uses `@ftptech/canton-agent-wallet` 2.7.1, which refuses a below-minimum or
+  uncovered swap before the ticket fee.
+
+## 2.6.0
+
+### Minor Changes
+
+- `swap_quote`, read-only and free: with no arguments it lists the Tradecraft
+  pools; with in, out and amount it quotes each venue `swap` would use, runs
+  swap's own limit gate, and names the venue that quotes more.
+- `find_paid_apis` shows how to call each API: query, JSON body, fields, note.
+- `pay`: with no asset it pays in CC when the API offers CC; a JSON body is
+  sent as application/json; after an HTTP error to a paid request the reply
+  says the API kept the payment and what to do next.
+- `swap` checks a token sale against the cap on a free quote before the ticket
+  fee, refuses an input the wallet cannot cover before the fee, and writes
+  failed swaps to the history. `withdraw` refuses a swap venue's party and says
+  CC only. `get_history` says what each move was; `get_balance` says what is
+  locked (sunstrike228/canton-x402#249).
+- Local only: `tradecraft_queued_fills`, the queued orders on a pool and what
+  became of them, with what each settlement paid (sunstrike228/canton-x402#251).
+- A failed swap's history line keeps this package's own wording, never text a
+  venue or endpoint sent back. `swap_quote` stops reading Tradecraft's pool list
+  past 1 MB, and says a direct or auto Tradecraft swap fills at market unless
+  `CANTON_AGENT_TRADECRAFT_MEMO_KEY` is set.
+
+## 2.5.0
+
+### Minor Changes
+
+- `claim` also takes back this wallet's own expired offers the receiver never
+  took, and says what came back and what is still waiting. A verify refusal on
+  such a withdraw is an error result.
+- `swap`: a token input defaults to Tradecraft; a token swap that times out
+  says the input sits in the venue's offer until it expires and `claim` then
+  returns it.
+- For a hosting server: with `newTools`, `get_balance` states the owner's limits
+  once (the `limits:` line names the limits page).
+- Requires `@ftptech/canton-agent-wallet` 2.6.0.
+
+## 2.4.0
+
+### Minor Changes
+
+- New read-only tools: `find_paid_apis` (the facilitator's catalogue of paid
+  APIs and their prices, cached for 5 minutes) and `get_guide` (a short guide
+  for the agent). Neither creates a wallet.
+- `get_balance` adds one line per token held and the spend limits left today.
+  Its first line is unchanged.
+- `pay` takes `max_cc` (a lower cap for this call only), `max_response_chars`
+  (default 4000, at most 20000) and `asset` (`CC` or `USDCx`). USDCx payments
+  run only when the owner sets both `--usdcx-max-per-tx` and
+  `--usdcx-daily-cap`; a cap that is not set is not "no cap".
+- Money moves (pay, withdraw, swap) are queued across processes that share one
+  wallet home (`<home>/.policy-lock`), so two hosts on one home cannot both pass
+  the daily cap.
+- `--single-payment` / `CANTON_MCP_SINGLE_PAYMENT`: at most one payment per
+  `pay` call.
+- `--allow-domains catalog`: pay only resources listed in the facilitator's
+  catalogue.
+- `pay` refuses to pay the wallet's own relay.
+- The money-move lock covers only the spend gate, the payment and its record,
+  not the merchant's body: a merchant that trickles its body no longer holds
+  every other move on the wallet, and a body that never ends is read for 30 s
+  at most. A queued withdraw or swap whose client stopped waiting sends
+  nothing. The Lighthouse cross-check gives up after 10 seconds.
+- Tradecraft queued mode on the local server: `tradecraft_queued_setup`,
+  `_orders`, `_status`, `_cancel` and `_withdraw` drive the wallet's `tc`
+  command (agent-wallet 2.4.0). Funding an allocation runs the spend policy
+  like `swap`. Needs a relay with the queued surface enabled; the hosted server
+  does not register them.
+- The server instructions start by pointing at `get_guide` and
+  `find_paid_apis`, and say that `pay` is one call, never retried.
+- For a hosting server: `SpendPolicy.limitsUrl` makes a refusal at a spend cap,
+  and `get_balance`, name the page where the owner changes the limits.
+  `get_history` and `send_feedback` are listed only when the host passes a
+  history store or a feedback sink; the local server has neither.
+- Includes everything in 2.3.1 (published from the release line).
+- Requires `@ftptech/canton-agent-wallet` 2.5.0.
+
+## 2.3.1
+
+### Patch Changes
+
+- `pay` counts the larger of the balance drop and the Canton Coin the signer
+  signed. A merchant that answered first and settled a few seconds later was
+  not in the balance read right after the call, so the daily cap and the
+  funded ceiling never saw it. When the signed amount is not in the balance
+  yet, the answer says so and that funds may still move.
+- Requires `@ftptech/canton-agent-wallet` 2.4.1. Published from the release
+  line `release/agent-wallet-2.4.1`.
+
 ## 2.3.0
 
 ### Minor Changes

@@ -22,6 +22,7 @@
  *    the input either way.
  */
 import { RelayClient } from "./relay-client.js";
+import { readSignerFromWallet } from "./keys.js";
 import { withdraw } from "./withdraw.js";
 import { selfProvisionRegistryPreapproval, claimAll } from "./tx.js";
 import { resolveHashBinding } from "./hash-binding.js";
@@ -91,12 +92,11 @@ export const CANTEX_MIN_INPUT_CC = 50;
 
 const AMM_PAIR_SEP = "-";
 
-/** Per-input-token advisory minimums, mirrored from the Tradecraft web app (there
- *  is NO API endpoint for these — they are a hardcoded frontend constant). A trade
- *  below the minimum is ADVISORY only: the pool safely returns the funds if it will
- *  not fill (no loss), and amounts slightly under still often fill. `swap` warns
- *  when the amount is under the listed minimum but does not block. Symbols not
- *  listed have no advertised minimum. */
+/** Per-input-token minimums, mirrored from the Tradecraft web app (there is NO
+ *  API endpoint for these — they are a hardcoded frontend constant). Below one,
+ *  the pool hands the input back unfilled. `swap` therefore refuses to buy a
+ *  ticket for such a trade (the fee would be lost) and only warns on a direct
+ *  swap, which pays no fee. Symbols not listed have no advertised minimum. */
 export const TRADECRAFT_MIN_INPUT: Readonly<Record<string, number>> = {
   CC: 6,
   USDCx: 1,
@@ -784,7 +784,7 @@ export async function executeSwap(opts: ExecuteSwapOpts): Promise<SwapResult> {
   if (!wallet) throw new Error("no wallet — run `create` first");
   const relay =
     opts.relay ??
-    new RelayClient({ relayUrl: wallet.relayUrl, apiKey: opts.apiKey });
+    new RelayClient({ relayUrl: wallet.relayUrl, apiKey: opts.apiKey, readSigner: readSignerFromWallet(wallet) });
   const hashBinding = opts.hashBinding ?? resolveHashBinding();
   const { ticket } = opts;
 

@@ -8,6 +8,8 @@ export * from "./tx.js";
 export * from "./merge.js";
 export * from "./withdraw.js";
 export * from "./pay.js";
+// The home-directory mutex: the local MCP queues its money moves with it.
+export { withHomeLock, type PayLockOpts } from "./pay-lock.js";
 export * from "./hash-binding.js";
 export * from "./canton-hash.js";
 export * from "./trusted-dso.js";
@@ -16,6 +18,7 @@ export * from "./registry-parties.js";
 // the SAME routing as the CLI instead of a second copy that drifts.
 export * from "./swap.js";
 export * from "./swap-route.js";
+export * from "./swap-cover.js";
 // Tradecraft queued mode (committed allocations + batched orders); the MCP
 // tools drive the same functions as the CLI `tc` command.
 export * from "./tradecraft-queued.js";

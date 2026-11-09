@@ -17,6 +17,7 @@
  */
 import type { CantonSigner } from "@ftptech/x402-canton-client";
 import { RelayClient } from "./relay-client.js";
+import { readSignerFromWallet } from "./keys.js";
 import {
   isStaleInputHoldingError,
   payViaTransferFactory,
@@ -117,9 +118,21 @@ export function makeRelaySigner(
      *  is anything else, defending against a MITM'd merchant that swaps `payTo`
      *  to drain funds to an attacker. Omitted → no pin (legacy behavior). */
     expectedPayTo?: string;
+    /**
+     * Called once for every transfer this signer has SIGNED, right before the
+     * signed bytes go back to the x402 client: the instrument as
+     * `"<admin>|<id>"` (Canton Coin included) and the amount in that
+     * instrument's ledger Decimal. A signed transfer is money the merchant's
+     * facilitator can settle, whether or not the call that asked for it then
+     * succeeds, so a caller that keeps a spend counter counts this, not only
+     * what the balance shows a moment later. It observes; it never decides: a
+     * hook that throws, or returns a promise that rejects, is ignored and the
+     * payment goes on.
+     */
+    onSigned?: (signed: { instrument: string; amount: string }) => void;
   } = {}
 ): CantonSigner {
-  const relay = new RelayClient({ relayUrl: wallet.relayUrl, apiKey: opts.apiKey });
+  const relay = new RelayClient({ relayUrl: wallet.relayUrl, apiKey: opts.apiKey, readSigner: readSignerFromWallet(wallet) });
   // Default to the env-resolved binding: the REAL conformant V2 hash recompute
   // (canton-hash.ts) unless the operator explicitly sets the
   // CANTON_AGENT_TRUST_RELAY_HASH escape hatch. A programmatic caller may pass a
@@ -310,6 +323,17 @@ export function makeRelaySigner(
           ...(Object.keys(venueMeta).length > 0 ? { venueMeta } : {}),
         })
       );
+      try {
+        const r = opts.onSigned?.({
+          instrument: instrumentKey(input.instrumentId.admin, input.instrumentId.id),
+          amount: input.amount,
+        }) as PromiseLike<unknown> | undefined;
+        // An async hook that rejects would otherwise be an unhandled
+        // rejection, which takes the whole process down.
+        if (typeof r?.then === "function") r.then(undefined, () => undefined);
+      } catch {
+        // The hook observes; a broken observer must not cancel a signed payment.
+      }
       // Hand the scheme builder the signed bytes so the payload carries the
       // transaction itself and resolves at ANY facilitator — the only carriage.
       return {

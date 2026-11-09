@@ -1,5 +1,160 @@
 # @ftptech/canton-agent-wallet
 
+## 2.8.1
+
+### Patch Changes
+
+- A plain token withdraw the relay prepared as a pending offer (the receiver
+  holds no TransferPreapproval for the token) is refused with
+  `RegistryOfferRefusedError`, which says so and that nothing was signed. It is
+  used only when the same bytes pass the offer-shape check; every other refusal
+  keeps its own error.
+- Uses `@ftptech/x402-canton-core` 1.9.1: a swap's pending offer must carry the
+  root transfer's terms.
+- `engines.node` is `>=20.18.1`, what its `undici` 7 dependency needs.
+
+## 2.8.0
+
+### Minor Changes
+
+- `pay` exits 2 when a payment was signed and the request did not end in a
+  2xx: the payment may have settled, do not pay again. 1 stays for failures
+  before anything was signed.
+- A paid request answered 5xx is re-sent with the same payment up to twice
+  (`paidResends`, 0 turns it off), then reported as `PAYMENT_UNCONFIRMED`. The
+  wallet never signs a second payment for it. A `Request` passed to the paying
+  fetch keeps its headers and body.
+- Reads of the wallet's own party carry a signed `X-Canton-Read-Proof`
+  (`readSigner`, `readSignerFromWallet`). The relay only counts them for now.
+- Before signing, a transfer's root, its delivery, what it creates and what it
+  archives are bound to what the wallet asked for, and a swap's memo and
+  deadline are pinned. A relay can no longer hand back a transfer that pays a
+  different amount or leaves a contract the payer signs for someone else.
+- `merge` waits out a 429 or a 503 `scan_busy` from the relay instead of
+  stopping. `preapproval` no longer buys a second preapproval when the relay
+  cannot tell whether one exists; `--force` still does.
+- Uses `@ftptech/x402-canton-core` 1.9.0, `@ftptech/x402-canton-client` 1.4.0
+  and `@ftptech/x402-canton-ledger` 0.6.5.
+
+## 2.7.2
+
+### Patch Changes
+
+- Uses `@ftptech/x402-canton-ledger` 0.6.4: a prepared transaction from the
+  relay whose node graph is cyclic, shared or too large is refused before it is
+  hashed, instead of hanging the wallet.
+- The policy lock timeout names claim too: another pay, withdraw, swap or claim
+  on this wallet is still running, and nothing was moved.
+
+## 2.7.1
+
+### Patch Changes
+
+- `swap` refuses, before buying the 0.01 CC ticket, a swap the wallet cannot
+  cover (CC input plus the fee, or unlocked token input) and a Tradecraft swap
+  below the pool's advertised minimum, which the pool does not take. A direct
+  swap, which pays no fee, may still try below the minimum. Found on MainNet:
+  CLI 2.7.0 paid the fee for both.
+- A relay answer that carries a rejected completion (for example
+  `LOCAL_VERDICT_INACTIVE_CONTRACTS` when a settlement recreated the allocation
+  a top-up was spending) says that transaction did not commit, and that steps
+  the command finished before it stand, instead of "may still commit". A
+  `LOCKED_CONTRACTS` rejection says another pending transaction holds an input:
+  wait for it, then check `balance`.
+- Messages: a direct or auto swap without a floor names
+  `CANTON_AGENT_TRADECRAFT_MEMO_KEY`; an unfilled input is said to wait in an
+  offer until it expires.
+
+## 2.7.0
+
+### Minor Changes
+
+- `tc fills --pair A/B`, and a line in `tc status`: each queued order and what
+  became of it (filled, cancelled with the venue's reason, withdrawn, expired),
+  with what its settlement paid. A fill is matched to the settlement that sent
+  exactly its input; the count of fills awaiting settlement is withheld when the
+  history cannot tell. Reads the relay's `/v1/wallet/<party>/tradecraft-updates`
+  (sunstrike228/canton-x402#251).
+- `tc withdraw` creates the request in the venue's package when the wallet
+  trusts it (Tradecraft 1.3.17 now), else in the newest trusted one.
+- `pay` sends `User-Agent: canton-agent-wallet` when the caller sets none:
+  Tradecraft's API answers 403 to Node's default.
+- `defaultAsset`: a preferred asset used only when the API offers it and the
+  caller chose none. `peekWalletPayment` picks the entry `pay` would pay
+  (sunstrike228/canton-x402#249).
+- `tc fills` and `tc status` show the relay's and the venue's text only in its
+  expected shape: a cancellation reason in Tradecraft's slippage form or plain
+  words, ids, times and amounts by format. Anything else is not shown, and a
+  malformed record withholds the count.
+
+## 2.6.1
+
+### Patch Changes
+
+- `claimAll` holds a Canton Coin claim to the network's DSO: the accepted
+  instruction must be one the DSO signed that pays the agent, and the agent must
+  get a DSO-signed Amulet. A registry claim is held to its registrar (offer and
+  created holding signed by it, holding owned by the agent). This uses
+  `@ftptech/x402-canton-core` 1.7.0. A network with no known DSO keeps the
+  previous check (sunstrike228/canton-x402#241).
+
+## 2.6.0
+
+### Minor Changes
+
+- `reclaimExpiredOffers(relay, wallet)`: withdraws this wallet's own registry
+  offers that the receiver never took and can no longer take (a minute past
+  `executeBefore`), so the input they lock comes back. Seen on MainNet: a swap
+  venue left token sells untaken and the input stayed locked. Each withdraw is
+  verified before signing against the signed offer (the registrar's
+  `TransferOffer`, sent by the agent, expired) and the returned holding (signed
+  by the registrar, owned by the agent). A relay without
+  `/v1/wallet/:party/outgoing` answers 404 and nothing is done. The CLI `claim`
+  runs it after accepting incoming transfers.
+- `RelayClient.outgoing(party)` and `RelayClient.resolveWithdraw(...)`.
+- A token sell defaults to Tradecraft: with the venue not named, a token input
+  routes to Tradecraft (Cantex has left token sells unaccepted), and `auto` no
+  longer quotes Cantex for a token input. A named `cantex` still goes to Cantex,
+  with a warning that the input may stay locked in the offer.
+- Requires `@ftptech/x402-canton-core` 1.6.0.
+
+## 2.5.0
+
+### Minor Changes
+
+- `withHomeLock(home, name, fn)`: a cross-process lock inside the wallet home,
+  generalised from the pay lock (`withPayLock` now calls it). The local MCP
+  server uses it to queue money moves across processes that share one home.
+- The home lock never spins the process: a lock it cannot take or reclaim (a
+  non-empty lock directory, a file or symlink at the lock path) waits between
+  tries and times out with the reason. A waiter whose time is up no longer
+  reclaims a lock that only looks stale (after a laptop sleep), so a live
+  holder is never pushed out.
+- Includes everything in 2.4.1 (published from the release line).
+
+## 2.4.1
+
+### Patch Changes
+
+- Onboarding refuses a relay-built PartyToParticipant whose
+  `party_signing_keys` holds any key besides the agent's own, and refuses a
+  repeated or malformed copy of the field. The decoder used to drop it, so a
+  relay could onboard the party with its own signing key next to the agent's
+  and later sign for it.
+- `withdraw` takes only `--to`, `--amount`, `--admin`, `--id` and
+  `--relay-url`, and refuses anything else. `withdraw --to P 5` or `--amt 5`
+  used to drop the amount and send the FULL balance.
+- A connection that drops during submit or execute is reported as an unknown
+  outcome (check `canton-agent-wallet balance` before retrying) instead of
+  "could not reach the relay, retry", which could send twice.
+- `makePayingFetchForWallet` forwards `onSigned` and `payableInstruments` to
+  the relay signer; `onSigned` is called for every transfer the signer signs.
+- Requires `@ftptech/x402-canton-client` 1.3.0: a payment is signed at most
+  once per request, and a paid request that fails in transit is
+  PAYMENT_UNCONFIRMED.
+- Published from the release line `release/agent-wallet-2.4.1` (2.4.0 plus
+  these fixes). The lock and asset changes on `main` still ship later.
+
 ## 2.4.0
 
 ### Minor Changes

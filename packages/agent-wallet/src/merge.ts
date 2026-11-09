@@ -44,6 +44,7 @@
 import { transfer } from "./tx.js";
 import {
   isHoldingsExceedNodeLimitError,
+  RelayHttpError,
   type RelayClient,
 } from "./relay-client.js";
 import type { AgentWallet } from "./store.js";
@@ -122,6 +123,8 @@ export interface MergeOptions {
   transferFn?: typeof transfer;
   /** @internal Progress sink (defaults to no-op). The CLI passes a logger. */
   onProgress?: (line: string) => void;
+  /** @internal How a wait on a busy relay is slept (tests make it instant). */
+  sleepFn?: (ms: number) => Promise<void>;
 }
 
 export interface MergeResult {
@@ -162,15 +165,17 @@ function chunk<T>(cids: readonly T[], size: number): T[][] {
  *  PUBLIC Scan snapshot (whale path). Returns the cids + whether Scan was used. */
 async function enumerateHoldingCids(
   relay: RelayClient,
-  party: string
+  party: string,
+  opts: MergeOptions
 ): Promise<{ cids: string[]; usedScan: boolean }> {
   try {
-    const bal = await relay.balance(party);
+    const bal = await withRelayBackoff(opts, () => relay.balance(party));
     return { cids: bal.holdings.map((h) => h.cid), usedScan: false };
   } catch (err) {
     if (!isHoldingsExceedNodeLimitError(err)) throw err;
     // Whale: the ledger can't enumerate this party — read the snapshot instead.
-    const scan = await relay.holdingsScan(party);
+    // A Scan read, so a busy relay sheds it for anonymous callers: wait it out.
+    const scan = await withRelayBackoff(opts, () => relay.holdingsScan(party));
     return { cids: scan.holdings.map((h) => h.cid), usedScan: true };
   }
 }
@@ -202,6 +207,56 @@ async function enumerateHoldingCids(
  * accounting. Every self-transfer pins receiver = wallet.party (verify-before-sign
  * enforced) — whale, chain, and live alike.
  */
+/** The longest single wait merge takes from a relay's Retry-After, and how many
+ *  waits one relay call (a batch or a read) may take. A relay asking for longer
+ *  (an abuse ban is hours) is not waited on, and the call fails as before. */
+const RELAY_BUSY_MAX_WAIT_S = 120;
+const RELAY_BUSY_MAX_WAITS = 10;
+
+/**
+ * Seconds to wait when the relay said "nothing was done, come back later", or
+ * undefined when the failure is anything else.
+ *
+ * A relay paces submissions facilitator-wide (a few a minute for one network)
+ * and holds back Scan reads when Scan is busy, so a whale merge of tens of
+ * batches meets a 429 by design. Both refusals come before anything is
+ * submitted, so running the same batch again is safe: its inputs are untouched.
+ * A read refused the same way did nothing either, and a read is safe to repeat.
+ * Not a 503 that may have committed (outcomeUnknown): that is never re-run.
+ */
+function relayBusyWaitSeconds(err: unknown): number | undefined {
+  let cur: unknown = err;
+  for (let depth = 0; cur && depth < 6; depth++) {
+    if (cur instanceof RelayHttpError) {
+      if (cur.outcomeUnknown) return undefined;
+      const shed =
+        cur.status === 503 && (cur.body as { error?: unknown } | undefined)?.error === "scan_busy";
+      if (cur.status !== 429 && !shed) return undefined;
+      const s = cur.retryAfterSeconds ?? 60;
+      return s <= RELAY_BUSY_MAX_WAIT_S ? s : undefined;
+    }
+    cur = (cur as { cause?: unknown }).cause;
+  }
+  return undefined;
+}
+
+/** Run one relay call (a batch transfer or a read), waiting out a busy relay
+ *  (see relayBusyWaitSeconds). */
+async function withRelayBackoff<T>(opts: MergeOptions, run: () => Promise<T>): Promise<T> {
+  const sleep = opts.sleepFn ?? ((ms: number) => new Promise<void>((done) => setTimeout(done, ms)));
+  const log = opts.onProgress ?? ((): void => {});
+  for (let waits = 0; ; waits++) {
+    try {
+      return await run();
+    } catch (err) {
+      const s = relayBusyWaitSeconds(err);
+      if (s === undefined || waits >= RELAY_BUSY_MAX_WAITS) throw err;
+      log(`  relay busy (${(err as Error).message.split("\n")[0]!.slice(0, 120)}); waiting ${s}s`);
+      await sleep(s * 1000);
+    }
+  }
+}
+
 /** One registry self-transfer of `batch` for its FULL sum — the registry then
  *  collapses the batch into a single Holding. receiver === wallet.party is the
  *  merge invariant, pinned here and re-checked by verify-before-sign. */
@@ -214,7 +269,7 @@ function registrySelfTransfer(
   batch: ReadonlyArray<{ cid: string; amount: string }>
 ): Promise<string> {
   const doTransfer = opts.transferFn ?? transfer;
-  return doTransfer(relay, wallet, {
+  return withRelayBackoff(opts, () => doTransfer(relay, wallet, {
     receiver: wallet.party, // SELF-transfer — the non-negotiable invariant.
     amount: sumLedgerDecimals(batch.map((x) => x.amount)), // FULL sum → one Holding.
     inputHoldingCids: batch.map((x) => x.cid),
@@ -224,7 +279,7 @@ function registrySelfTransfer(
     expectInstrumentId: id,
     trustedRegistryParties:
       opts.trustedRegistryParties ?? resolveTrustedRegistryParties(admin, process.env),
-  });
+  }));
 }
 
 /** The cost gate for a registry merge: refuse to submit without `--yes` when
@@ -277,7 +332,7 @@ async function mergeRegistryHoldings(
     live: Array<{ cid: string; amount: string }>;
     complete: boolean;
   }> => {
-    const h = await relay.holdings(wallet.party, { admin, id }, { slice: true });
+    const h = await withRelayBackoff(opts, () => relay.holdings(wallet.party, { admin, id }, { slice: true }));
     const ins = h.instruments.find((i) => i.admin === admin && i.id === id);
     return {
       live: (ins?.holdings ?? []).filter((x) => !x.locked).map(({ cid, amount }) => ({ cid, amount })),
@@ -388,7 +443,9 @@ export async function mergeAllRegistryHoldings(
     cantonCoin: number;
     complete: boolean;
   }> => {
-    const h = await relay.holdings(wallet.party, undefined, { slice: true, registryOnly: true });
+    const h = await withRelayBackoff(opts, () =>
+      relay.holdings(wallet.party, undefined, { slice: true, registryOnly: true })
+    );
     const groups: Group[] = [];
     const untrusted: string[] = [];
     let cantonCoin = 0;
@@ -527,17 +584,20 @@ export async function mergeHoldings(
   // security invariant — pinned here (caller intent) and re-checked by
   // verify-before-sign inside `transfer` before it signs.
   const mergeBatch = (cids: string[]): Promise<string> =>
-    doTransfer(relay, wallet, {
-      receiver: wallet.party, // SELF-transfer — the non-negotiable invariant.
-      amount: ONE_ATOMIC, // 1 atomic; the change amulet absorbs the rest (no fee math).
-      inputHoldingCids: cids,
-      hashBinding,
-      ...(instrumentAdmin !== undefined ? { expectInstrumentAdmin: instrumentAdmin } : {}),
-    });
+    withRelayBackoff(opts, () =>
+      doTransfer(relay, wallet, {
+        receiver: wallet.party, // SELF-transfer — the non-negotiable invariant.
+        amount: ONE_ATOMIC, // 1 atomic; the change amulet absorbs the rest (no fee math).
+        inputHoldingCids: cids,
+        hashBinding,
+        ...(instrumentAdmin !== undefined ? { expectInstrumentAdmin: instrumentAdmin } : {}),
+      })
+    );
 
   const { cids: initialCids, usedScan } = await enumerateHoldingCids(
     relay,
-    wallet.party
+    wallet.party,
+    opts
   );
 
   // ── Dry run: report the plan, execute nothing (never gated). ──
@@ -610,7 +670,7 @@ export async function mergeHoldings(
   // fatal: warn and continue — the final balance() phase still catches leftovers.
   const absorbOutputs = async (updateId: string): Promise<void> => {
     try {
-      const out = await relay.txAmulets(wallet.party, updateId);
+      const out = await withRelayBackoff(opts, () => relay.txAmulets(wallet.party, updateId));
       addToPool(out.amulets.map((a) => a.cid));
     } catch (err) {
       log(
@@ -699,7 +759,7 @@ export async function mergeHoldings(
       prefetched = undefined;
     } else {
       try {
-        const bal = await relay.balance(wallet.party);
+        const bal = await withRelayBackoff(opts, () => relay.balance(wallet.party));
         liveCids = bal.holdings.map((h) => h.cid);
       } catch (err) {
         if (isHoldingsExceedNodeLimitError(err)) {

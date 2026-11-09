@@ -64,6 +64,42 @@ describe("money moves run inside deps.serialize", () => {
     expect(log.filter((e) => e === "exit")).toHaveLength(2);
   });
 
+  it("queues claim: two claims at once would accept the same transfers twice", async () => {
+    const log: string[] = [];
+    let queue: Promise<unknown> = Promise.resolve();
+    const client = await connect({
+      ...baseDeps(log),
+      relayFor: () =>
+        ({
+          pending: async () => {
+            log.push("pending");
+            await new Promise((r) => setTimeout(r, 10));
+            return { pending: [] };
+          },
+          outgoing: async () => ({ outgoing: [] }),
+          balance: async () => ({ cc: "10" }),
+        }) as never,
+      serialize: (fn) => {
+        const run = queue.then(async () => {
+          log.push("enter");
+          try {
+            return await fn();
+          } finally {
+            log.push("exit");
+          }
+        });
+        queue = run.catch(() => undefined);
+        return run;
+      },
+    });
+    const results = await Promise.all([
+      client.callTool({ name: "claim", arguments: {} }),
+      client.callTool({ name: "claim", arguments: {} }),
+    ]);
+    expect(results.map((r) => r.isError ?? false)).toEqual([false, false]);
+    expect(log).toEqual(["enter", "pending", "exit", "enter", "pending", "exit"]);
+  });
+
   it("leaves balance reads outside it", async () => {
     const log: string[] = [];
     const client = await connect(baseDeps(log));

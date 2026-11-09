@@ -95,3 +95,13 @@ describe("buildPreferAssetSelector", () => {
     expect(buildPreferAssetSelector("eurx")!([CC, eur])).toBe(eur);
   });
 });
+
+describe("buildPreferAssetSelector as a default (fallBackToFirst)", () => {
+  it("pays the default asset when offered, else the first entry, and never throws", () => {
+    const byDefault = buildPreferAssetSelector("CC", { fallBackToFirst: true })!;
+    expect(byDefault([USDCX, CC])).toBe(CC);
+    expect(byDefault([USDCX])).toBe(USDCX);
+    // Named, it still fails closed.
+    expect(() => buildPreferAssetSelector("CC")!([USDCX])).toThrow(/does not offer that instrument/);
+  });
+});

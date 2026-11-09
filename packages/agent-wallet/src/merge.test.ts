@@ -627,3 +627,149 @@ describe("mergeHoldings — whale-pass cost gate (--yes)", () => {
     expect(lines.join("\n")).toMatch(/--yes/);
   });
 });
+
+describe("mergeHoldings — a busy relay is waited on, not a reason to stop", () => {
+  const whaleRelay = () =>
+    stubRelay({
+      balances: [whale413(), balanceOf(holdings(2))],
+      scan: {
+        party: PARTY,
+        source: "scan-snapshot",
+        recordTime: "2026-07-02T12:00:00Z",
+        holdings: holdings(180, "s"), // 2 batches of 90
+        complete: true,
+      },
+    });
+  const busy = (status: number, body: unknown, retryAfter: number | undefined) =>
+    new RelayHttpError(`relay POST /v1/wallet/submit/execute -> ${status}`, status, body, false, retryAfter);
+
+  it("waits out a 429's Retry-After and goes on with the same batch", async () => {
+    // The relay's facilitator-wide submission minute is small on purpose; a
+    // whale merge must pace itself to it, not abort.
+    const { relay } = whaleRelay();
+    let n = 0;
+    const fn = vi.fn(async (): Promise<string> => {
+      n++;
+      if (n === 1) throw busy(429, { error: "relay submissions are rate-limited facilitator-wide; nothing was submitted" }, 2);
+      return `u${n}`;
+    }) as unknown as typeof transfer;
+    const waits: number[] = [];
+    const res = await mergeHoldings(relay, wallet(), {
+      batch: 90,
+      transferFn: fn,
+      sleepFn: async (ms: number) => {
+        waits.push(ms);
+      },
+    });
+    expect(waits).toEqual([2_000]);
+    expect(res.rounds).toBe(2);
+    expect(res.updateIds).toEqual(["u2", "u3"]);
+  });
+
+  it("a shed Scan read (503 scan_busy) is waited on too", async () => {
+    const { relay } = whaleRelay();
+    let n = 0;
+    const fn = vi.fn(async (): Promise<string> => {
+      n++;
+      if (n === 1) throw busy(503, { error: "scan_busy" }, 1);
+      return `u${n}`;
+    }) as unknown as typeof transfer;
+    const waits: number[] = [];
+    const res = await mergeHoldings(relay, wallet(), { batch: 90, transferFn: fn, sleepFn: async (ms: number) => void waits.push(ms) });
+    expect(waits).toEqual([1_000]);
+    expect(res.rounds).toBe(2);
+  });
+
+  it("does not wait on a long ban, a 503 that may have committed, or forever", async () => {
+    const run = async (err: Error) => {
+      const { relay } = whaleRelay();
+      const fn = vi.fn(async (): Promise<string> => {
+        throw err;
+      }) as unknown as typeof transfer;
+      const waits: number[] = [];
+      const p = mergeHoldings(relay, wallet(), { batch: 90, transferFn: fn, sleepFn: async (ms: number) => void waits.push(ms) });
+      await expect(p).rejects.toThrow(/merge aborted during whale batch/);
+      return { waits, calls: (fn as unknown as { mock: { calls: unknown[] } }).mock.calls.length };
+    };
+    // An abuse ban answers 429 with a Retry-After of hours.
+    expect((await run(busy(429, { error: "temporarily suspended for repeated abuse" }, 3600))).waits).toEqual([]);
+    // A 503 on a submitting route may have committed: never re-run.
+    const unknown = new RelayHttpError("relay POST /v1/wallet/submit/execute -> 503", 503, { error: "scan_busy" }, true, 1);
+    expect((await run(unknown)).waits).toEqual([]);
+    // A relay that never stops refusing: bounded.
+    const forever = await run(busy(429, { error: "too many submissions" }, 1));
+    expect(forever.waits.length).toBeGreaterThan(0);
+    expect(forever.waits.length).toBeLessThanOrEqual(10);
+  });
+});
+
+describe("mergeHoldings — a busy relay on a READ is waited on as well", () => {
+  const busyRead = (route: string, status: number, body: unknown, retryAfter: number) =>
+    new RelayHttpError(`relay GET /v1/wallet/x/${route} -> ${status}`, status, body, false, retryAfter);
+  const snapshot = (n: number): HoldingsScanResult => ({
+    party: PARTY,
+    source: "scan-snapshot",
+    recordTime: "2026-07-02T12:00:00Z",
+    holdings: holdings(n, "s"),
+    complete: true,
+  });
+
+  it("a shed holdings-scan (503 scan_busy) does not end an anonymous whale merge at its start", async () => {
+    const { relay } = stubRelay({ balances: [whale413(), balanceOf(holdings(2))] });
+    let scans = 0;
+    (relay as unknown as { holdingsScan: unknown }).holdingsScan = vi.fn(async () => {
+      scans++;
+      if (scans === 1) throw busyRead("holdings-scan", 503, { error: "scan_busy" }, 1);
+      return snapshot(180);
+    });
+    const t = mockTransfer();
+    const waits: number[] = [];
+    const res = await mergeHoldings(relay, wallet(), { batch: 90, transferFn: t.fn, sleepFn: async (ms) => void waits.push(ms) });
+    expect(waits).toEqual([1_000]);
+    expect(scans).toBe(2);
+    expect(res).toMatchObject({ rounds: 2, usedScan: true });
+  });
+
+  it("a rate-limited balance read (429), at the start and in the final phase, is waited on", async () => {
+    const { relay, balanceCalls } = stubRelay({
+      balances: [
+        busyRead("balance", 429, { error: "too many wallet reads; retry in a minute" }, 60),
+        balanceOf(holdings(5)),
+        busyRead("balance", 429, { error: "too many wallet reads; retry in a minute" }, 60),
+        balanceOf(holdings(2)),
+      ],
+    });
+    const t = mockTransfer();
+    const waits: number[] = [];
+    const res = await mergeHoldings(relay, wallet(), { transferFn: t.fn, sleepFn: async (ms) => void waits.push(ms) });
+    expect(waits).toEqual([60_000, 60_000]);
+    expect(balanceCalls()).toBe(4);
+    expect(res).toMatchObject({ rounds: 1, finalHoldings: 2 });
+  });
+
+  it("a rate-limited tx-amulets read is waited on, so the chain phase still gets that batch's outputs", async () => {
+    let first = true;
+    const { relay } = stubRelay({
+      balances: [whale413(), balanceOf(holdings(2))],
+      scan: snapshot(180),
+      txAmulets: (u) => {
+        if (u === "u1" && first) {
+          first = false;
+          return busyRead("tx-amulets", 429, { error: "too many wallet reads; retry in a minute" }, 60);
+        }
+        return [
+          { cid: `${u}-a`, amount: "1" },
+          { cid: `${u}-b`, amount: "1" },
+        ];
+      },
+    });
+    const t = mockTransfer();
+    const waits: number[] = [];
+    const res = await mergeHoldings(relay, wallet(), { batch: 90, transferFn: t.fn, sleepFn: async (ms) => void waits.push(ms) });
+    expect(waits).toEqual([60_000]);
+    // Both whale batches' outputs (4) reach the pool, so one chain round runs.
+    expect(res.chainedRounds).toBe(1);
+    expect(t.calls[2]!.cids).toEqual(["u1-a", "u1-b", "u2-a", "u2-b"]);
+  });
+});
+

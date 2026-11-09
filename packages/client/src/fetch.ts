@@ -13,7 +13,8 @@
  *
  * Limitations:
  * - The original request body must be replayable (e.g. JSON string,
- *   Uint8Array, FormData). Streaming bodies will fail on retry.
+ *   Uint8Array, FormData). A Request's own body is replayed from a copy; a
+ *   stream passed as `init.body` will fail on retry.
  * - Idempotency: callers should treat the wrapped fetch as
  *   at-most-twice. If the second response is still 402 we throw —
  *   no infinite-loop retries.
@@ -53,26 +54,28 @@ export interface WrapFetchOptions {
   networkFilter?: (network: CantonNetwork) => boolean;
   /** Tiebreaker among multiple exact accepts. Default: first matching entry. */
   selectRequirements?: (candidates: PaymentRequirements[]) => PaymentRequirements;
-  /** On a 402 that PERSISTS after paying — transient facilitator/ledger states,
-   *  not a hard rejection: the v1 first-payment `counter_not_ready` dead-zone
-   *  (the SV creates the payer's counter a few seconds after the first
-   *  TransferCommand), or a payer input amulet that rolled over (holding-fee per
-   *  mining round) on rapid-fire back-to-back payments — re-pay FROM SCRATCH
-   *  (a fresh `createPaymentPayload` reads the ledger again: fresh nonce + fresh
-   *  input amulet) up to this many EXTRA times with exponential backoff. Default
-   *  4. 0 restores the old at-most-twice behavior. */
+  /** Retries of a network error while building the payment, before it is signed. Default 4. */
   maxPaymentRetries?: number;
-  /** Base backoff before the first re-pay; doubles each attempt. Default 3000ms. */
+  /** Base backoff before the first retry; doubles each attempt. Default 3000ms.
+   *  Also spaces the re-sends of a signed payment answered 5xx. */
   paymentRetryBaseMs?: number;
   /** Cap on any single backoff. Default 12000ms. */
   paymentRetryMaxMs?: number;
+  /** Re-sends of the SAME signed payment when the paid request is answered
+   *  5xx. Default 2; 0 disables. Never a second payment either way: a 5xx left
+   *  after the last re-send is PAYMENT_UNCONFIRMED. */
+  paidResends?: number;
   /** Injectable sleep (tests). Default `setTimeout`. */
   sleep?: (ms: number) => Promise<void>;
 }
 
 export class X402PaymentError extends Error {
-  constructor(message: string, public readonly code: X402PaymentErrorCode) {
-    super(message);
+  constructor(
+    message: string,
+    public readonly code: X402PaymentErrorCode,
+    options?: { cause?: unknown }
+  ) {
+    super(message, options);
     this.name = "X402PaymentError";
   }
 }
@@ -85,7 +88,9 @@ export type X402PaymentErrorCode =
   /**
    * The facilitator could not confirm the payment. It MAY have settled
    * on-ledger. Do not pay again from this outcome — read the payer's balance or
-   * the merchant's receipt first.
+   * the merchant's receipt first. Also thrown when the paid request fails in
+   * transit, or is redirected and then answered 402 or refused for its header,
+   * or is still answered 5xx after the same payment was re-sent.
    *
    * Distinct from PAYMENT_REJECTED because `code` is the only machine-readable
    * field on this error, and an integrator branches on it. The ambiguity guard
@@ -113,12 +118,21 @@ export function wrapFetchWithCantonPayment(
   const scheme = new ExactCantonScheme(signer);
 
   return async function fetchWithPayment(input, init) {
+    // A Request carries its own headers and body, and `init` replaces either
+    // only when it sets it (ky and some SDKs call fetch this way). The paid
+    // retry used to be built from `init` alone: measured, it went out without
+    // the Request's Authorization, and a POST body the first send had read
+    // could not be sent again after the payment was signed.
+    const request = typeof Request === "function" && input instanceof Request ? input : undefined;
+    const sentHeaders = new Headers(init?.headers ?? request?.headers);
     // If the caller is already attempting payment (has the signature
     // header) just pass through — don't recurse.
-    const initHeaders = new Headers(init?.headers);
-    if (initHeaders.has(HEADER_PAYMENT_SIGNATURE_V2)) {
+    if (sentHeaders.has(HEADER_PAYMENT_SIGNATURE_V2)) {
       return fetch(input, init);
     }
+    // An unread copy for the paid send; the first send consumes the body.
+    const replay = request?.clone();
+    const signal = init?.signal !== undefined ? init.signal : request?.signal;
 
     const first = await fetch(input, init);
     if (first.status !== 402) return first;
@@ -181,44 +195,16 @@ export function wrapFetchWithCantonPayment(
     const chosen =
       options.selectRequirements?.(compatible) ?? (compatible[0] as PaymentRequirements);
 
-    // Re-pay loop. A 402 that persists after paying is usually TRANSIENT on the
-    // v1 facilitator-pays-gas path: the first-payment counter dead-zone (the SV
-    // creates the payer's TransferCommandCounter a few seconds after the first
-    // TransferCommand), or a payer input amulet that rolled over (holding-fee per
-    // mining round) on rapid-fire back-to-back payments. Each attempt re-runs
-    // createPaymentPayload, which reads the ledger fresh (fresh nonce + fresh
-    // input amulet), so the next attempt picks up the now-ready counter / current
-    // amulet. Bounded with exponential backoff; the funds-moved gate on the
-    // facilitator guarantees no double-spend across attempts (a settled payment
-    // returns non-402 and we stop).
+    // Only building the payment is retried. Once it is signed, a 402 never
+    // re-pays: the merchant writes that 402 and may already have settled.
     const maxRetries = options.maxPaymentRetries ?? 4;
     const baseMs = options.paymentRetryBaseMs ?? 3000;
     const capMs = options.paymentRetryMaxMs ?? 12000;
+    const paidResends = Number.isFinite(options.paidResends)
+      ? Math.max(0, Math.trunc(options.paidResends as number))
+      : PAID_RESENDS;
     const sleep =
       options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
-
-    // Each attempt re-runs createPaymentPayload, which on the v1
-    // (external-party-amulet-rules) path mints a FRESH `TransferCommand`
-    // on-ledger — a Create the payer pays Global Synchronizer traffic for
-    // (~$0.40). So a blind "retry maxRetries times" loop burns one Create per
-    // attempt even when re-paying cannot possibly help (e.g. the payer has no
-    // funds, or the merchant has no preapproval — both surface as a repeating
-    // `unexpected_canton_ledger_error`). Read the facilitator's reason off the
-    // 402 body and STOP EARLY when a fresh re-pay is demonstrably not making
-    // progress, instead of spending the whole budget on doomed Creates.
-    //
-    // A reason that a fresh envelope is expected to CLEAR IN ONE SHOT (a fresh
-    // input amulet / preapproval for a ledger error) but that REPEATS is
-    // systemic — re-paying again only burns another Create, so we bail.
-    // Deliberately NOT in this set:
-    //   - counter_not_ready — the first-payment dead-zone clears with TIME; a
-    //     repeat is expected, keep retrying with backoff.
-    //   - nonce_reuse — ALWAYS transient: either same-wallet contention (the
-    //     counter is advancing — the next fresh nonce wins) or Scan lag (the
-    //     relay's lag-free high-water clamp hands the correct nonce on the next
-    //     resolve, and raw-Scan readers clear within a backoff or two). Bailing
-    //     early here turned recoverable rapid-fire into hard payment failures.
-    const STOP_IF_REPEATED = new Set(["unexpected_canton_ledger_error"]);
 
     /**
      * Reasons where the outcome is AMBIGUOUS about whether money moved, so a
@@ -232,13 +218,25 @@ export function wrapFetchWithCantonPayment(
      * holdings — so if the first one did commit, the payer pays twice for one
      * purchase and the second payment exists in no record.
      *
-     * STOP_IF_REPEATED is the wrong tool: it allows exactly one re-pay before
-     * bailing, and one re-pay is already the double payment. Ambiguity has to
-     * stop on the FIRST occurrence and hand the decision to whoever can check
-     * the ledger.
+     * `unexpected_canton_ledger_error` is what a facilitator running without
+     * the dispatch mark (CANTON_X402_SETTLE_DISPATCH_MARK=off, the default)
+     * answers for that same unknown outcome. `payment_already_redeemed` and
+     * `invalid_exact_canton_payment_already_settled` say this payment already
+     * settled: the money has moved, and paying again is a second payment.
+     *
+     * Stopping is not enough here: the caller must also be told the payment
+     * may have settled, so it does not pay again itself. Ambiguity stops on
+     * the FIRST occurrence and hands the decision to whoever can check the
+     * ledger.
      */
-    const STOP_ON_FIRST = new Set(["invalid_exact_canton_execute_failed"]);
-    let lastReason: string | undefined;
+    const STOP_ON_FIRST = new Set([
+      "invalid_exact_canton_execute_failed",
+      "unexpected_canton_ledger_error",
+      "payment_already_redeemed",
+      "invalid_exact_canton_payment_already_settled",
+      // The transfer was relayed and its outcome is not known yet.
+      "settlement_pending",
+    ]);
 
     for (let attempt = 0; ; attempt++) {
       // createPaymentPayload talks to the relay/ledger over the network; a
@@ -251,35 +249,72 @@ export function wrapFetchWithCantonPayment(
         envelope = await scheme.createPaymentPayload(chosen, required.resource);
       } catch (err) {
         if (attempt >= maxRetries || !isTransientNetworkError(err)) throw err;
-        lastReason = undefined; // a network blip is not a settle reason
         await sleep(Math.min(baseMs * 2 ** attempt, capMs));
         continue;
       }
-      const retryHeaders = new Headers(init?.headers);
+      const retryHeaders = new Headers(sentHeaders);
       const signatureHeader = encodeBase64Json(envelope);
       retryHeaders.set(HEADER_PAYMENT_SIGNATURE_V2, signatureHeader);
-      const resp = await fetch(input, { ...init, headers: retryHeaders });
+      // Already aborted: the paid request is never sent, so the abort stands.
+      if (signal?.aborted) throw signal.reason;
+      const sendPaid = async (): Promise<Response> => {
+        try {
+          return await fetch(replay?.clone() ?? input, { ...init, headers: retryHeaders });
+        } catch (err) {
+          // Redirects are followed, so even a refused connection can be a later
+          // hop failing after the merchant settled.
+          throw new X402PaymentError(
+            `the paid request failed in transit, so the payment may already have ` +
+              `settled on-ledger and this client will NOT pay again. Check the ` +
+              `payer's balance / the merchant's receipt before retrying`,
+            "PAYMENT_UNCONFIRMED",
+            { cause: err }
+          );
+        }
+      };
+      let resp = await sendPaid();
+      // A 5XX IS NOT THE END OF THE PAYMENT. Our express middleware settles
+      // before the handler and, on a 5xx, gives the ticket back so the SAME
+      // header is served again ("retry the same payment"); the facilitator
+      // answers a replay of settled bytes from its idempotency record. This
+      // used to hand the 5xx back as an ordinary response and keep the header
+      // to itself, so nobody could retry it. Re-send the same signed payment,
+      // bounded, never a new one. Not after a redirect: an earlier hop may
+      // have delivered.
+      const firstStatus = resp.status;
+      let resent = 0;
+      while (isServerError(resp.status) && !resp.redirected && resent < paidResends) {
+        await resp.body?.cancel().catch(() => undefined);
+        await sleep(Math.min(baseMs * 2 ** resent, capMs));
+        resent += 1;
+        resp = await sendPaid();
+      }
+      if (isServerError(resp.status)) {
+        await resp.body?.cancel().catch(() => undefined);
+        if (resp.redirected) throw unconfirmedAfterRedirect(resp.status);
+        const settled = settlementOf(resp);
+        throw unconfirmed(
+          `the merchant answered HTTP ${resp.status} to the paid request` +
+            (resent > 0 ? `, also after re-sending the same payment ${resent === 1 ? "once" : `${resent} times`}` : "") +
+            (settled !== undefined ? ` (it reported the settlement ${settled})` : "")
+        );
+      }
       if (resp.status !== 402) {
-        await throwIfEdgeRejectedPaymentHeader(resp, signatureHeader.length);
+        await throwIfEdgeRejectedPaymentHeader(
+          resp,
+          signatureHeader.length,
+          resent > 0 ? firstStatus : undefined
+        );
         return resp;
       }
+      if (resp.redirected) throw unconfirmedAfterRedirect(resp.status);
       const reason = await read402Reason(resp);
-      // AMBIGUITY IS CHECKED FIRST, BEFORE THE RETRY BUDGET.
-      //
-      // Both branches stop; they differ in what they TELL the caller, and on
-      // this reason that difference is the whole point. The exhaustion message
-      // asserts "facilitator rejected the payment" — a definite verdict — and
-      // it used to run first, so an ambiguous reason arriving on the final
-      // attempt was reported as a rejection. An agent or operator acting on
-      // "rejected" pays again for a purchase that may already have settled,
-      // which is exactly the double payment STOP_ON_FIRST exists to prevent.
-      //
-      // The ordering also made the guard unreachable on a whole configuration:
-      // with `maxPaymentRetries: 0` — documented right here as "restores the
-      // old at-most-twice behavior" — `attempt(0) >= maxRetries(0)` is true on
-      // the first 402, so STOP_ON_FIRST never ran at all.
-      //
-      // A re-pay here risks a SECOND real payment, so stop immediately.
+      if (resent > 0) {
+        throw unconfirmed(
+          `the merchant answered HTTP ${firstStatus} to the paid request and 402` +
+            `${reason ? ` (${reason})` : ""} to the same payment re-sent`
+        );
+      }
       if (reason !== undefined && STOP_ON_FIRST.has(reason)) {
         throw new X402PaymentError(
           `the facilitator could not confirm the payment (${reason}) — it may ` +
@@ -288,26 +323,11 @@ export function wrapFetchWithCantonPayment(
           "PAYMENT_UNCONFIRMED"
         );
       }
-      // Budget spent. Reached only for reasons that are NOT ambiguous, so
-      // "rejected" is a claim this branch is now entitled to make.
-      if (attempt >= maxRetries) {
-        throw new X402PaymentError(
-          `payment retry still returned 402 after ${attempt + 1} attempt(s) — ` +
-            `facilitator rejected the payment${reason ? ` (${reason})` : ""}`,
-          "PAYMENT_REJECTED"
-        );
-      }
-      // Non-progressing: the same clear-in-one-shot reason twice in a row means a
-      // further re-pay would only burn another doomed Create. Stop now.
-      if (reason !== undefined && reason === lastReason && STOP_IF_REPEATED.has(reason)) {
-        throw new X402PaymentError(
-          `payment kept failing with the same reason (${reason}) across re-pays — ` +
-            `a fresh payment is not resolving it; not burning further attempts`,
-          "PAYMENT_REJECTED"
-        );
-      }
-      lastReason = reason;
-      await sleep(Math.min(baseMs * 2 ** attempt, capMs));
+      throw new X402PaymentError(
+        `payment returned 402 after it was signed${reason ? ` (${reason})` : ""}; ` +
+          `this client will not pay again for this request`,
+        "PAYMENT_REJECTED"
+      );
     }
   };
 }
@@ -345,14 +365,6 @@ function isTransientNetworkError(err: unknown): boolean {
 }
 
 /**
- * Best-effort read of the facilitator's failure reason from a 402 the resource
- * server returned after a settle attempt. The express integration responds
- * `402 {"error": "<errorReason>"}` on a failed settle, so the reason rides the
- * JSON body. Always fail-soft (returns undefined on any parse/read error) — the
- * reason only ever lets the re-pay loop stop SOONER; it is never required for
- * correctness.
- */
-/**
  * A 431, or nginx's stock 400 page ("Request Header Or Cookie Too Large"), in
  * reply to the PAID retry is an edge in front of the merchant refusing the
  * payment header — not an x402 answer, and not a merchant decision. A real
@@ -365,11 +377,15 @@ function isTransientNetworkError(err: unknown): boolean {
  * stays intact on the pass-through path. Money-safety: the signed payment
  * never reached the merchant, so nothing settled; it expires on its own
  * (executeBefore) — this error is safe to re-pay from once the merchant's
- * edge is fixed.
+ * edge is fixed. After a redirect the merchant may have settled on an earlier
+ * hop, so that case is PAYMENT_UNCONFIRMED instead.
  */
 async function throwIfEdgeRejectedPaymentHeader(
   resp: Response,
-  sentHeaderBytes: number
+  sentHeaderBytes: number,
+  /** Status of an earlier send of this same payment, when this is a re-send:
+   *  that send reached the merchant, so "nothing settled" no longer holds. */
+  earlierStatus?: number
 ): Promise<void> {
   if (resp.status !== 431 && resp.status !== 400) return;
   if (resp.status === 400) {
@@ -380,6 +396,13 @@ async function throwIfEdgeRejectedPaymentHeader(
       return;
     }
     if (!/Request Header Or Cookie Too Large/i.test(body)) return;
+  }
+  if (resp.redirected) throw unconfirmedAfterRedirect(resp.status);
+  if (earlierStatus !== undefined) {
+    throw unconfirmed(
+      `the merchant answered HTTP ${earlierStatus} to the paid request and its edge refused ` +
+        `the same payment re-sent (HTTP ${resp.status})`
+    );
   }
   throw new X402PaymentError(
     `the merchant's edge rejected the ${sentHeaderBytes}-byte payment header before the ` +
@@ -393,12 +416,90 @@ async function throwIfEdgeRejectedPaymentHeader(
   );
 }
 
+/** Default `paidResends`: re-sends of the SAME signed payment after the paid
+ *  request is answered 5xx, spaced by the payment backoff (3 s, then 6 s). */
+const PAID_RESENDS = 2;
+
+function isServerError(status: number): boolean {
+  return status >= 500 && status <= 599;
+}
+
+/** PAYMENT_UNCONFIRMED for an outcome that may have settled: `what` says why. */
+function unconfirmed(what: string): X402PaymentError {
+  return new X402PaymentError(
+    `${what}, so the payment may already have settled on-ledger and this client will ` +
+      `NOT pay again. Check the payer's balance / the merchant's receipt before retrying`,
+    "PAYMENT_UNCONFIRMED"
+  );
+}
+
+/** The settlement id a merchant attached (PAYMENT-RESPONSE), if readable. */
+function settlementOf(resp: Response): string | undefined {
+  try {
+    const s = readPaymentResponseHeader<{ transaction?: unknown }>(resp);
+    return typeof s?.transaction === "string" && s.transaction.length > 0 ? s.transaction : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The answer came after a redirect, and the merchant may already have settled
+ * before redirecting.
+ */
+function unconfirmedAfterRedirect(status: number): X402PaymentError {
+  return new X402PaymentError(
+    `the paid request was redirected and the last hop answered HTTP ${status}, so ` +
+      `the merchant may already have settled the payment and this client will NOT ` +
+      `pay again. Check the payer's balance / the merchant's receipt before retrying`,
+    "PAYMENT_UNCONFIRMED"
+  );
+}
+
+/**
+ * Best-effort read of the facilitator's failure reason from a 402 the resource
+ * server returned to a paid request. The express integration answers a failed
+ * settle with `402 {"error": "<errorReason>"}`, and a failed verify with an
+ * empty `{}` body and the reason in the `error` field of the PAYMENT-REQUIRED
+ * header. So the body is read first and the header is the fallback, decoded the
+ * same way as the requirements on the first 402. Always fail-soft (undefined on
+ * any read or parse error).
+ */
 async function read402Reason(resp: Response): Promise<string | undefined> {
+  // A server on the official x402 SDK answers a failed settle 402 with an empty
+  // body and puts the reason only in PAYMENT-RESPONSE, so it is read first:
+  // without it the reason was always unknown and the payment read as rejected.
+  return read402SettleReason(resp) ?? (await read402BodyReason(resp)) ?? read402HeaderReason(resp);
+}
+
+function read402SettleReason(resp: Response): string | undefined {
+  const header = resp.headers.get(HEADER_PAYMENT_RESPONSE_V2);
+  if (!header) return undefined;
+  try {
+    const settle = decodeBase64Json<{ errorReason?: unknown } | null>(header);
+    return typeof settle?.errorReason === "string" ? settle.errorReason : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function read402BodyReason(resp: Response): Promise<string | undefined> {
   try {
     const text = await resp.text();
     if (!text) return undefined;
     const body = JSON.parse(text) as { error?: unknown };
     return typeof body.error === "string" ? body.error : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function read402HeaderReason(resp: Response): string | undefined {
+  const header = resp.headers.get(HEADER_PAYMENT_REQUIRED_V2);
+  if (!header) return undefined;
+  try {
+    const required = decodeBase64Json<{ error?: unknown } | null>(header);
+    return typeof required?.error === "string" ? required.error : undefined;
   } catch {
     return undefined;
   }

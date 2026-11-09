@@ -153,3 +153,23 @@ describe("the boolean flag does not silently invert", () => {
     );
   });
 });
+
+describe("--single-payment", () => {
+  it("is off unless asked for", () => {
+    expect(resolveConfig([], baseEnv).singlePayment).toBe(false);
+  });
+
+  it("the bare switch, or CANTON_MCP_SINGLE_PAYMENT=true / 1, turns it on", () => {
+    expect(resolveConfig(["--single-payment"], baseEnv).singlePayment).toBe(true);
+    expect(resolveConfig([], { ...baseEnv, CANTON_MCP_SINGLE_PAYMENT: "true" }).singlePayment).toBe(true);
+    expect(resolveConfig([], { ...baseEnv, CANTON_MCP_SINGLE_PAYMENT: "1" }).singlePayment).toBe(true);
+    expect(resolveConfig([], { ...baseEnv, CANTON_MCP_SINGLE_PAYMENT: "false" }).singlePayment).toBe(false);
+  });
+
+  it("refuses a spelling it would have to guess at", () => {
+    expect(() => resolveConfig(["--single-payment=false"], baseEnv)).toThrow(/single-payment is a bare switch/);
+    expect(() => resolveConfig([], { ...baseEnv, CANTON_MCP_SINGLE_PAYMENT: "yes please" })).toThrow(
+      /CANTON_MCP_SINGLE_PAYMENT must be true or false/
+    );
+  });
+});

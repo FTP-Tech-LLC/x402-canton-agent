@@ -34,3 +34,21 @@ describe("explainRelayFailure names the lapsed payee preapproval", () => {
     expect(explainRelayFailure("")).toBeUndefined();
   });
 });
+
+describe("explainRelayFailure names a rejection verdict as final", () => {
+  it("a contract that changed meanwhile, and any other local verdict", () => {
+    // Only this transaction is known not to have committed: earlier steps of
+    // the command stand, and a LOCKED input belongs to a transaction in flight.
+    expect(explainRelayFailure('{"detail":"interactive submission rejected: LOCAL_VERDICT_LOCKED_CONTRACTS(11,ab): x"}')).toBe(
+      "the participant rejected the transaction (LOCAL_VERDICT_LOCKED_CONTRACTS): another pending transaction holds an input of this one. Wait for it, then check `balance` before running this again."
+    );
+    expect(explainRelayFailure('{"detail":"interactive submission rejected: LOCAL_VERDICT_INACTIVE_CONTRACTS(11,ab): x"}')).toBe(
+      "the participant rejected the transaction (LOCAL_VERDICT_INACTIVE_CONTRACTS): a contract it spends changed meanwhile. This transaction did not commit and charged nothing. Steps this command finished before it stand: check `balance` (and `tc status`) before running it again."
+    );
+    expect(explainRelayFailure('{"detail":"interactive submission rejected: DAML_AUTHORIZATION_ERROR(8,ab): x"}')).toBe(
+      "the participant rejected the transaction (DAML_AUTHORIZATION_ERROR). This transaction did not commit and charged nothing. Steps this command finished before it stand: check `balance` (and `tc status`) before running it again."
+    );
+    expect(explainRelayFailure('{"detail":"POST /v2/interactive-submission/execute failed: fetch failed"}')).toBeUndefined();
+  });
+});
+

@@ -17,9 +17,10 @@
  * the tag names the wallet the payment went through. `CANTON_AGENT_VENUE_KEY` /
  * `CANTON_AGENT_VENUE_TAG` override the key / value (an operator attributing to
  * their own venue), and `CANTON_AGENT_VENUE_KEY=off` disables stamping. The tag rides in
- * `transfer.meta.values` (a standard CIP-56 field) — advisory, not money-critical,
- * and not pinned by verify-before-sign; a stray value can only misattribute a
- * reward, never move funds. Canton Coin (Amulet) is never stamped: it is not a
+ * `transfer.meta.values` (a standard CIP-56 field) — advisory, not money-critical:
+ * a stray value can only misattribute a reward, never move funds. verify-before-
+ * sign pins it where the wallet builds the transfer (withdraw, swap), not on a
+ * payment, whose transfer the relay builds. Canton Coin (Amulet) is never stamped: it is not a
  * CIP-56 registry token and its rewards accrue through the ordinary Amulet path.
  */
 

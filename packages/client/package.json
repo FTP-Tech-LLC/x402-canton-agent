@@ -1,7 +1,7 @@
 {
   "name": "@ftptech/x402-canton-client",
-  "version": "1.2.2",
-  "description": "Canton x402 client SDK — payer side. ExactCantonScheme + signer abstractions for autonomous agents.",
+  "version": "1.4.0",
+  "description": "Payer-side x402 client for Canton: a fetch wrapper that pays a 402 with a signed Canton transfer.",
   "license": "Apache-2.0",
   "author": "FTP team",
   "homepage": "https://github.com/FTP-Tech-LLC/x402-canton-agent/tree/main/packages/client#readme",
@@ -43,8 +43,8 @@
     "lint": "eslint src --max-warnings 0"
   },
   "dependencies": {
-    "@ftptech/x402-canton-core": "^1.4.0",
-    "@ftptech/x402-canton-ledger": "^0.6.2"
+    "@ftptech/x402-canton-core": "^1.9.1",
+    "@ftptech/x402-canton-ledger": "^0.6.5"
   },
   "publishConfig": {
     "access": "public"

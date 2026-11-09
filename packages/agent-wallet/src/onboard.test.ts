@@ -13,6 +13,9 @@ import {
   rawPoint,
   keyFingerprint,
   topologyMultiHash,
+  namespaceDelegationTx,
+  partyToParticipantWithKeysTx,
+  versionedTx,
 } from "./_topology-fixture.js";
 
 let tmp: string;
@@ -202,6 +205,36 @@ describe("ensureWallet", () => {
     expect(loadWallet()).toBeNull();
   });
 
+  it("REFUSES when the relay adds its own key to party_signing_keys", async () => {
+    // Real generate-topology shape (NamespaceDelegation + PartyToParticipant in
+    // the versioned envelope) with an honest multiHash, but the relay's key sits
+    // next to the agent's in PartyToParticipant.party_signing_keys, threshold 1.
+    const relayKey = signingKey(rawPoint(generateAgentKey().publicKeySpkiB64));
+    const evil = {
+      onboardPrepare: vi.fn().mockImplementation(async (b: { publicKey: { keyData: string } }) => {
+        const point = rawPoint(b.publicKey.keyData);
+        const fingerprint = await keyFingerprint(point);
+        const party = `agent::${fingerprint}`;
+        const txs = [
+          versionedTx(namespaceDelegationTx(fingerprint, signingKey(point))),
+          versionedTx(partyToParticipantWithKeysTx(party, [signingKey(point), relayKey], 1)),
+        ];
+        return {
+          party,
+          publicKeyFingerprint: fingerprint,
+          onboardingTransactions: txs,
+          hashToSign: await topologyMultiHash(txs),
+        };
+      }),
+      onboardFinalize: vi.fn().mockResolvedValue({ party: "x" }),
+    };
+    await expect(
+      ensureWallet({ relayUrl: "http://relay", network: "canton:testnet", relay: evil as never })
+    ).rejects.toThrow(OnboardingTopologyMismatchError);
+    expect(evil.onboardFinalize).not.toHaveBeenCalled();
+    expect(loadWallet()).toBeNull();
+  });
+
   it("REFUSES when the relay hashToSign does NOT match the recomputed multiHash", async () => {
     // The topology is honest (binds the agent's own key) but the relay returns a
     // multiHash of a DIFFERENT bundle — the agent must not blind-sign it.
@@ -251,5 +284,36 @@ describe("ensureWallet", () => {
     ).rejects.toThrow(OnboardingTopologyMismatchError);
     expect(evil.onboardFinalize).not.toHaveBeenCalled();
     expect(loadWallet()).toBeNull();
+  });
+});
+
+describe("ensureWallet: the starter-grant poll proves the new wallet's reads", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("sends X-Canton-Read-Proof on the pending poll, none on the onboarding calls", async () => {
+    const relay = mockRelay();
+    const seen: Array<{ url: string; method: string; proof: string | undefined }> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init: RequestInit = {}) => {
+        const headers = (init.headers ?? {}) as Record<string, string>;
+        seen.push({ url, method: String(init.method), proof: headers["x-canton-read-proof"] });
+        const body = init.body ? JSON.parse(String(init.body)) : undefined;
+        let out: unknown = { pending: [], kinds: [] };
+        if (url.endsWith("/onboard/prepare")) out = await relay.onboardPrepare(body);
+        else if (url.endsWith("/onboard/finalize"))
+          out = { party: relay.built().party, starterGrant: { status: "scheduled", amountCc: "1" } };
+        return new Response(JSON.stringify(out), { status: 200 });
+      })
+    );
+    await ensureWallet({
+      relayUrl: "http://relay.test",
+      network: "canton:testnet",
+      starterGrantTimeoutMs: 40,
+      starterGrantPollMs: 10,
+    });
+    const polls = seen.filter((c) => c.url.includes("/pending"));
+    expect(polls.length).toBeGreaterThan(0);
+    for (const p of polls) expect(p.proof).toMatch(/^v1\.\d+\.[A-Za-z0-9_-]{86}$/);
+    for (const c of seen.filter((c) => !c.url.includes("/pending"))) expect(c.proof).toBeUndefined();
   });
 });

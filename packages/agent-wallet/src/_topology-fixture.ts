@@ -29,12 +29,13 @@ import {
   PartyToKeyMapping,
   NamespaceDelegation,
   PartyToParticipant,
+  SigningPublicKey,
   CryptoKeyFormat,
   Enums_TopologyChangeOp,
   Enums_ParticipantPermission,
-  type SigningPublicKey,
   type TopologyMapping,
 } from "@canton-network/core-ledger-proto";
+import { len, vintField } from "./_prepared-fixture.js";
 
 /** The bare 32-byte Ed25519 point from an SPKI/DER base64 (trailing 32 bytes). */
 export function rawPoint(spkiB64: string): Uint8Array {
@@ -108,6 +109,66 @@ export function partyToParticipantTx(
       ],
     }),
   });
+}
+
+/** Raw PartyToParticipant bytes (party, threshold 1, one participant). */
+export function partyToParticipantBytes(
+  party: string,
+  participantUid = "PAR::participant::1220feed"
+): Buffer {
+  return Buffer.from(
+    PartyToParticipant.toBinary(
+      PartyToParticipant.create({
+        party,
+        threshold: 1,
+        participants: [
+          { participantUid, permission: Enums_ParticipantPermission.CONFIRMATION },
+        ],
+      })
+    )
+  );
+}
+
+/** SigningKeysWithThreshold bytes (keys = 1, threshold = 2). */
+export function signingKeysWithThreshold(keys: SigningPublicKey[], threshold: number): Buffer {
+  return Buffer.concat([
+    ...keys.map((k) => len(1, Buffer.from(SigningPublicKey.toBinary(SigningPublicKey.create(k))))),
+    ...(threshold === 0 ? [] : [vintField(2, threshold)]),
+  ]);
+}
+
+/** A TopologyTransaction (ADD_REPLACE, serial 1) over raw PartyToParticipant
+ *  bytes. core-ledger-proto 1.4.0 has no PartyToParticipant.party_signing_keys
+ *  (field 6), so a mapping that carries it has to be built by hand. */
+export function partyToParticipantRawTx(p2p: Uint8Array): string {
+  return Buffer.concat([
+    vintField(1, Enums_TopologyChangeOp.ADD_REPLACE),
+    vintField(2, 1),
+    len(3, len(9, Buffer.from(p2p))),
+  ]).toString("base64");
+}
+
+/** PartyToParticipant topology tx with party_signing_keys = {keys, threshold}. */
+export function partyToParticipantWithKeysTx(
+  party: string,
+  keys: SigningPublicKey[],
+  threshold = 1
+): string {
+  return partyToParticipantRawTx(
+    Buffer.concat([
+      partyToParticipantBytes(party),
+      len(6, signingKeysWithThreshold(keys, threshold)),
+    ])
+  );
+}
+
+/** Wrap a topology tx in Canton's versioned envelope (data = 1, version = 2),
+ *  the form a live participant's generate-topology returns. */
+export function versionedTx(txB64: string, version = 30): string {
+  return Buffer.concat([
+    len(1, Buffer.from(txB64, "base64")),
+    vintField(2, version),
+  ]).toString("base64");
 }
 
 /** The Canton multiHash (base64) over a set of topology transaction base64s —
