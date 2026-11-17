@@ -18,6 +18,8 @@ import {
   str,
   vintField,
   vNumeric,
+  vList,
+  vOptional,
   vParty,
   vRecord,
   type TransferOpts,
@@ -353,3 +355,131 @@ function buildRootInjected(): string {
   ]);
   return Buffer.concat([len(1, damlTx), len(2, metadata)]).toString("base64");
 }
+
+/* Splice 0.10 (splice-amulet 0.1.25): a FeaturedAppRight can name operational
+ * parties (on MainNet the DSO sets them). When the preapproval provider is
+ * featured, its right is fetched as an input, so those parties sit in that
+ * input's argument. Every refusal below leaves the ops party as the ONLY foreign
+ * candidate, so each test fails if its gate is removed. */
+const OPS_A = "ops-a::1220abab";
+const OPS_B = "ops-b::1220cdcd";
+const OPS_REFUSED = /unexpected party "ops-a::1220abab"/;
+const vNone = () => len(10 /* Value.optional, empty */, Buffer.alloc(0));
+
+function featuredRightArg(o: { dso?: string; provider?: string; ops?: string[] | null } = {}): Buffer {
+  const fields = [
+    { label: "dso", value: vParty(o.dso ?? DSO) },
+    { label: "provider", value: vParty(o.provider ?? PROVIDER) },
+  ];
+  if (o.ops !== null) {
+    fields.push(
+      { label: "activityWeight", value: vNone() },
+      { label: "appKind", value: vNone() },
+      {
+        label: "opsParties",
+        value: o.ops === undefined ? vNone() : vOptional(vList(o.ops.map((p) => vParty(p)))),
+      }
+    );
+  }
+  return vRecord(fields);
+}
+
+function featuredRightInput(o: Parameters<typeof featuredRightArg>[0] & { signatories?: string[] } = {}): Buffer {
+  return inputContract({
+    contractId: "00featured",
+    template: "Splice.Amulet:FeaturedAppRight",
+    argument: featuredRightArg(o),
+    signatories: o.signatories ?? [DSO],
+  });
+}
+
+/** The merchant as its own provider: signed by exactly {dso, merchant}. */
+const selfPreapprovalInput = (signatories: string[] = [DSO, MERCHANT]) =>
+  inputContract({
+    contractId: PRE_CID,
+    template: "Splice.AmuletRules:TransferPreapproval",
+    argument: preapprovalArg({ provider: MERCHANT }),
+    signatories,
+  });
+
+describe("provider's featured app right with operational parties (Splice 0.10)", () => {
+  it("accepts ops parties in the matched provider's own right", () => {
+    const b64 = build({
+      extraNodes: [honestDelivery],
+      inputs: [honestPreapprovalInput, featuredRightInput({ ops: [OPS_A, OPS_B] })],
+    });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).not.toThrow();
+  });
+
+  it("accepts a right created before 0.10, and one with no ops parties", () => {
+    for (const ops of [null, undefined, []] as const) {
+      const b64 = build({
+        extraNodes: [honestDelivery],
+        inputs: [honestPreapprovalInput, featuredRightInput({ ops: ops === null ? null : ops === undefined ? undefined : [...ops] })],
+      });
+      expect(() => assertPreparedTransferMatches(b64, EXPECT), String(ops)).not.toThrow();
+    }
+  });
+
+  it("accepts ops parties in the merchant's own right when it provides its own preapproval", () => {
+    const b64 = build({
+      extraNodes: [honestDelivery],
+      inputs: [selfPreapprovalInput(), featuredRightInput({ provider: MERCHANT, ops: [OPS_A] })],
+    });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).not.toThrow();
+  });
+
+  it("refuses ops parties in the right of a party that is not the provider", () => {
+    const b64 = build({
+      extraNodes: [honestDelivery],
+      inputs: [honestPreapprovalInput, featuredRightInput({ provider: MERCHANT, ops: [OPS_A] })],
+    });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).toThrow(OPS_REFUSED);
+  });
+
+  it("refuses ops parties in a right not signed by the DSO alone", () => {
+    for (const signatories of [[DSO, MERCHANT], [MERCHANT], [DSO, DSO]]) {
+      const b64 = build({
+        extraNodes: [honestDelivery],
+        inputs: [honestPreapprovalInput, featuredRightInput({ ops: [OPS_A], signatories })],
+      });
+      expect(() => assertPreparedTransferMatches(b64, EXPECT), signatories.join(",")).toThrow(OPS_REFUSED);
+    }
+  });
+
+  it("refuses ops parties in a right whose dso is not the pinned DSO", () => {
+    const b64 = build({
+      extraNodes: [honestDelivery],
+      inputs: [honestPreapprovalInput, featuredRightInput({ dso: SENDER, ops: [OPS_A] })],
+    });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).toThrow(OPS_REFUSED);
+  });
+
+  it("refuses ops parties when no preapproval is delivered through", () => {
+    const b64 = build({ inputs: [featuredRightInput({ provider: MERCHANT, ops: [OPS_A] })] });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).toThrow(OPS_REFUSED);
+  });
+
+  it("refuses ops parties when the merchant's own preapproval is not what the transfer spends", () => {
+    const b64 = build({
+      inputs: [selfPreapprovalInput(), featuredRightInput({ provider: MERCHANT, ops: [OPS_A] })],
+    });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).toThrow(OPS_REFUSED);
+  });
+
+  it("an ops party still cannot own a created Amulet", () => {
+    const b64 = build({
+      extraNodes: [
+        honestDelivery,
+        createNode({
+          nodeId: "2",
+          template: "Splice.Amulet:Amulet",
+          argument: vRecord([{ label: "owner", value: vParty(OPS_A) }]),
+        }),
+      ],
+      inputs: [honestPreapprovalInput, featuredRightInput({ ops: [OPS_A] })],
+    });
+    expect(() => assertPreparedTransferMatches(b64, EXPECT)).toThrow(/unexpected part[\s\S]*ops-a::1220abab/);
+  });
+});
+

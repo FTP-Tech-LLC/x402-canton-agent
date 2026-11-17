@@ -66,9 +66,9 @@ export interface McpConfig {
   network: string;
   apiKey?: string | undefined;
   policy: SpendPolicy;
-  /** --single-payment / CANTON_MCP_SINGLE_PAYMENT: one `pay` call settles at
-   *  most one payment (the paying fetch does not re-pay a merchant that keeps
-   *  answering 402), as on the hosted server. Off by default. */
+  /** --single-payment / CANTON_MCP_SINGLE_PAYMENT: one `pay` call builds at
+   *  most one payment (no retry of building it), as on the hosted server. A
+   *  signed payment is never paid again on a 402 either way. Off by default. */
   singlePayment?: boolean | undefined;
 }
 
