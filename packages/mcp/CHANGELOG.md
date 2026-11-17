@@ -1,5 +1,12 @@
 # @ftptech/canton-x402-mcp
 
+## 2.7.3
+
+### Patch Changes
+
+- `withdraw`: a send whose outcome is unknown (the relay timed out or dropped after submitting) now counts against the daily cap and the funded ceiling, since it may have left the wallet. Before, only a confirmed send was counted.
+- `withdraw` without an amount sends the balance it checked against the caps, so the amount checked, sent and counted is the same. Before, the send read the balance again.
+
 ## 2.7.2
 
 ### Patch Changes

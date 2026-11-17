@@ -16,6 +16,7 @@ import {
   PreparedTransferMismatchError,
   classifyPending,
   withdraw,
+  isOutcomeUnknownError,
   executeSwap,
   resolveSwapIntent,
   resolveSwapTicket,
@@ -97,8 +98,9 @@ export interface PayingFetchOpts {
   maxPaymentValueByInstrument?: Readonly<Record<string, string>>;
   /** Called for every transfer the signer signs. */
   onSigned?: (signed: { instrument: string; amount: string }) => void;
-  /** `0` means this call pays at most once: no re-pay of a merchant that keeps
-   *  answering 402 (pay asks for it whenever max_cc is set, and for USDCx).
+  /** `0` means this call builds its payment once, with no retry of building it
+   *  (pay asks for it whenever max_cc is set, and for USDCx). A signed payment
+   *  is never paid again on a 402 whatever this is.
    *  Absent, the server's own setting applies. */
   maxPaymentRetries?: number;
 }
@@ -962,8 +964,8 @@ export function registerWalletTools(server: McpServer, deps: WalletToolDeps): vo
             // Never passed for CC: a non-empty instrument map makes the signer
             // refuse Canton Coin when no CC ceiling is set.
             maxPaymentValueByInstrument: { [USDCX_INSTRUMENT_KEY]: capDecimal10(usdcxCeiling, policy.usdcxDailyCap) },
-            // One signature per call: each re-pay would get the same ceiling,
-            // and five of them could pass the daily USDCx cap in one call.
+            // One signature per call, so the daily USDCx cap is checked against
+            // exactly one payment.
             maxPaymentRetries: 0,
           };
         } else if (asset === "CC") {
@@ -1012,9 +1014,8 @@ export function registerWalletTools(server: McpServer, deps: WalletToolDeps): vo
             };
           }
         }
-        // The ceiling is checked on each signed payment, and a server that
-        // re-pays a merchant still answering 402 could sign several in this
-        // call. max_cc is the agent's cap on the CALL, so with it: no re-pays.
+        // The ceiling is checked on each signed payment. max_cc is the agent's
+        // cap on the CALL, so with it the call signs exactly one payment.
         const payingFetch = await payingFetchFor(w, {
           ...(ceiling === undefined
             ? {}
@@ -1232,10 +1233,12 @@ export function registerWalletTools(server: McpServer, deps: WalletToolDeps): vo
           "withdraw refused: that is a swap venue. Use swap: it sets up the delivery of what you buy, and a plain send to a venue can lose it. Nothing was sent."
         );
       }
+      // Outside the try: a send whose outcome is unknown still counts against the caps.
+      let effective: number | undefined;
       try {
         const w = await getWallet();
         // Resolve the effective amount up front so caps apply to the REAL number.
-        let effective: number;
+        let sweep: string | undefined;
         if (amount && amount.trim()) {
           effective = toNum(amount);
         } else if (policy.maxPerTx !== undefined) {
@@ -1243,11 +1246,14 @@ export function registerWalletTools(server: McpServer, deps: WalletToolDeps): vo
             "withdraw blocked: a per-tx cap is set, so an explicit amount is required (refusing a full-balance sweep)."
           );
         } else {
-          effective = toNum((await relayFor(w).balance(w.party)).cc);
+          sweep = (await relayFor(w).balance(w.party)).cc;
+          effective = toNum(sweep);
         }
         assertWithdrawAllowed(policy, (await ledger.read(Date.now())), effective, to);
         const wopts: { to: string; amount?: string; apiKey?: string } = { to };
-        const amt = amount?.trim();
+        // A sweep sends the balance read above, so the amount the caps checked,
+        // the amount sent and the amount booked are one number.
+        const amt = amount?.trim() || sweep;
         if (amt) wopts.amount = amt;
         if (apiKey) wopts.apiKey = apiKey;
         const r = await withdraw({ ...wopts, wallet: w, relay: relayFor(w) });
@@ -1255,6 +1261,15 @@ export function registerWalletTools(server: McpServer, deps: WalletToolDeps): vo
         await recordOp({ kind: "withdraw", amountCC: toNum(r.amount), detail: `to ${to}`, updateId: r.updateId, ok: true });
         return { sent: { to, amount: r.amount, updateId: r.updateId, landed: r.landed } };
       } catch (err) {
+        // The send went out and its result was lost: it may have left the
+        // wallet, so the daily cap and the funded ceiling count it, as swap does.
+        if (effective !== undefined && isOutcomeUnknownError(err)) {
+          try {
+            await ledger.recordOutbound(effective, Date.now());
+          } catch {
+            // The agent's error matters more than the bookkeeping's.
+          }
+        }
         return toolError("withdraw", err);
       }
     }))
