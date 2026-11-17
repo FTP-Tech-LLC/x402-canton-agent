@@ -17,7 +17,7 @@ This wallet pays for HTTP APIs that answer `402 Payment Required` (the x402 prot
 - A `pay` call pays at most once: a seller that answers 402 after being paid is not paid again. Set `max_cc` to cap what the call may spend.
 - If `pay` fails, call `get_balance` before anything else. When the reply says funds moved, do not pay again for the same request.
 - `max_cc` can only lower the owner's limits. `max_response_chars` asks for more of a long response body; set it on the first call. The hosted wallet returns at most 4000 characters, and paying again returns the same part.
-- `pay` and `swap` can take longer than your client waits (many stop at 60 seconds). A timeout is not a failure: the call goes on. Do not call it again; wait 2 minutes, then call `get_balance` (and `get_history` on the hosted wallet).
+- `pay` and `swap` can take longer than your client waits (many stop at 60 seconds). A timeout is not a failure: the call goes on. Do not call it again. A signed payment can still settle until its deadline, `executeBeforeSeconds` in the 402 (usually 2 to 5 minutes), so wait that out plus a minute, then call `get_balance` (and `get_history` on the hosted wallet).
 - The owner sets the limits, not you: a cap per payment, a cap per day, and which hosts may be paid. A refused payment says which limit stopped it. Only the owner can change it: on the hosted wallet's account page, or in the local wallet's start command (`--max-per-tx`, `--daily-cap`).
 
 ## Funding

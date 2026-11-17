@@ -1,5 +1,13 @@
 # @ftptech/canton-x402-mcp
 
+## 2.7.2
+
+### Patch Changes
+
+- `get_guide`: after a `pay` or `swap` timeout, wait out the payment deadline (`executeBeforeSeconds`
+  in the 402, usually 2 to 5 minutes) plus a minute before reading the balance. It said 2 minutes.
+- Uses `@ftptech/canton-agent-wallet` 2.8.2.
+
 ## 2.7.1
 
 ### Patch Changes

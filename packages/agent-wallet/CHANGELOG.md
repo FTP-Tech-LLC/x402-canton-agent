@@ -1,5 +1,13 @@
 # @ftptech/canton-agent-wallet
 
+## 2.8.2
+
+### Patch Changes
+
+- Uses `@ftptech/x402-canton-core` 1.9.2: from 2026-12-01 (Splice 0.10) a payment to a merchant whose
+  preapproval provider's featured app right names operational parties is no longer refused.
+- `undici` 7.30.2, which fixes the advisories on 7.25.
+
 ## 2.8.1
 
 ### Patch Changes
